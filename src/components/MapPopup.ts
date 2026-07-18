@@ -4,7 +4,7 @@ import type { AirportDelayAlert, PositionSample } from '@/services/aviation';
 import type { Earthquake } from '@/services/earthquakes';
 import type { WeatherAlert } from '@/services/weather';
 import type { RadiationObservation } from '@/services/radiation';
-import { UNDERSEA_CABLES } from '@/config';
+import { UNDERSEA_CABLES } from '@/config/geo-map';
 import type { StartupHub, Accelerator, TechHQ, CloudRegion } from '@/config/tech-geo';
 import type { TechHubActivity } from '@/services/tech-activity';
 import type { GeoHubActivity } from '@/services/geo-activity';
@@ -26,6 +26,9 @@ import { sparkline } from '@/utils/sparkline';
 import { getAuthState } from '@/services/auth-state';
 import { hasPremiumAccess } from '@/services/panel-gating';
 import { trackGateHit } from '@/services/analytics';
+import { renderPopupSourceLinks } from './map-popup-source-links';
+import { setTrustedHtml, trustedHtml } from '@/utils/dom-utils';
+
 
 // ── Static HS2 sector breakdown per chokepoint ────────────────────────────────
 // Based on IEA/UNCTAD estimated trade composition. Updated periodically.
@@ -75,7 +78,7 @@ function formatPositionSource(source: string): string {
 function fmtUtcTime(utc: string | undefined): string {
   if (!utc) return '\u2014';
   const d = new Date(utc.includes('T') ? utc : utc.replace(' ', 'T') + 'Z');
-  return isNaN(d.getTime()) ? '\u2014' : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return Number.isNaN(d.getTime()) ? '\u2014' : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
 function fmtDelayMin(min: number | undefined): string {
@@ -123,9 +126,9 @@ interface GpsJammingPopupData {
   lat: number;
   lon: number;
   level: 'medium' | 'high';
-  npAvg: number;
-  sampleCount: number;
-  aircraftCount: number;
+  pct: number;
+  affectedAircraft: number;
+  totalAircraft: number;
 }
 
 interface IranEventPopupData {
@@ -252,9 +255,9 @@ export class MapPopup {
     this.popup.className = this.isMobileSheet ? 'map-popup map-popup-sheet' : 'map-popup';
 
     const content = this.renderContent(data);
-    this.popup.innerHTML = this.isMobileSheet
+    setTrustedHtml(this.popup, trustedHtml(this.isMobileSheet
       ? `<button class="map-popup-sheet-handle" aria-label="${t('common.close')}"></button>${content}`
-      : content;
+      : content, "legacy direct innerHTML migration"));
 
     // Get container's viewport position for absolute positioning
     const containerRect = this.container.getBoundingClientRect();
@@ -444,7 +447,7 @@ export class MapPopup {
     this.isMobileSheet = false;
     this.popup = document.createElement('div');
     this.popup.className = 'map-popup map-popup-route-breakdown';
-    this.popup.innerHTML = html;
+    setTrustedHtml(this.popup, trustedHtml(html, "legacy direct innerHTML migration"));
 
     const containerRect = this.container.getBoundingClientRect();
     this.positionDesktopPopup({ x, y, type: 'waterway', data: {} as never }, containerRect);
@@ -825,6 +828,14 @@ export class MapPopup {
             </details>
           </div>
         ` : ''}
+        <div class="popup-section">
+          <details class="conflict-history-details">
+            <summary>📜 HISTORICAL PROFILE</summary>
+            <div class="conflict-history-content">
+              <div class="popup-loading">Loading…</div>
+            </div>
+          </details>
+        </div>
       </div>
     `;
   }
@@ -1059,27 +1070,81 @@ export class MapPopup {
       if (!this.popup || !container.isConnected) return;
 
       if (articles.length === 0) {
-        container.innerHTML = `
+        setTrustedHtml(container, trustedHtml(`
           <div class="hotspot-gdelt-header">${t('popups.liveIntel')}</div>
           <div class="hotspot-gdelt-loading">${t('popups.noCoverage')}</div>
-        `;
+        `, "legacy direct innerHTML migration"));
         return;
       }
 
-      container.innerHTML = `
+      setTrustedHtml(container, trustedHtml(`
         <div class="hotspot-gdelt-header">${t('popups.liveIntel')}</div>
         <div class="hotspot-gdelt-articles">
           ${articles.slice(0, 5).map(article => this.renderGdeltArticle(article)).join('')}
         </div>
-      `;
+      `, "legacy direct innerHTML migration"));
     } catch (error) {
       if (container.isConnected) {
-        container.innerHTML = `
+        setTrustedHtml(container, trustedHtml(`
           <div class="hotspot-gdelt-header">${t('popups.liveIntel')}</div>
           <div class="hotspot-gdelt-loading">${t('common.error')}</div>
-        `;
+        `, "legacy direct innerHTML migration"));
       }
     }
+  }
+
+  public loadConflictHistory(conflict: ConflictZone): void {
+    if (!this.popup) return;
+    const details = this.popup.querySelector<HTMLDetailsElement>('.conflict-history-details');
+    const content = this.popup.querySelector('.conflict-history-content');
+    if (!details || !content) return;
+
+    let loaded = false;
+
+    const onToggle = async () => {
+      if (!details.open || loaded) return;
+      loaded = true;
+
+      try {
+        const { fetchUcdpEvents, deriveConflictHistory } = await import('@/services/conflict');
+        const resp = await fetchUcdpEvents();
+
+        if (!this.popup || !content.isConnected) return;
+
+        const { conflictSince, recordedFatalities } = deriveConflictHistory(conflict, resp.data);
+
+        const rows = [
+          conflictSince
+            ? `<div class="popup-stat"><span class="stat-label">CONFLICT SINCE</span><span class="stat-value">${escapeHtml(conflictSince)}</span></div>`
+            : '',
+          conflict.peaceAgreements?.length
+            ? `<div class="popup-stat"><span class="stat-label">PEACE AGREEMENTS</span><span class="stat-value">${conflict.peaceAgreements.map(escapeHtml).join('<br>')}</span></div>`
+            : '',
+          recordedFatalities > 0
+            ? `<div class="popup-stat"><span class="stat-label">RECORDED FATALITIES</span><span class="stat-value">~${recordedFatalities.toLocaleString()}</span></div>`
+            : conflict.totalFatalities
+            ? `<div class="popup-stat"><span class="stat-label">TOTAL FATALITIES</span><span class="stat-value">${escapeHtml(conflict.totalFatalities)}</span></div>`
+            : '',
+        ].filter(Boolean).join('');
+
+        setTrustedHtml(
+          content,
+          trustedHtml(
+            rows || `<div class="popup-loading">No historical data available.</div>`,
+            'legacy direct innerHTML migration'
+          )
+        );
+      } catch {
+        if (content.isConnected) {
+          setTrustedHtml(
+            content,
+            trustedHtml(`<div class="popup-loading">Could not load history.</div>`, 'legacy direct innerHTML migration')
+          );
+        }
+      }
+    };
+
+    details.addEventListener('toggle', onToggle, { once: true });
   }
 
   public async loadWingbitsLiveFlight(hexCode: string): Promise<void> {
@@ -1094,7 +1159,7 @@ export class MapPopup {
       if (!this.popup || !section.isConnected) return;
 
       if (!live) {
-        section.innerHTML = '';
+        setTrustedHtml(section, trustedHtml('', "legacy direct innerHTML migration"));
         return;
       }
 
@@ -1162,17 +1227,17 @@ export class MapPopup {
       if (live.verticalRate !== 0) rows.push(`<div class="popup-stat"><span class="stat-label">Climb</span><span class="stat-value">${live.verticalRate > 0 ? '+' : ''}${Math.round(live.verticalRate)} fpm</span></div>`);
 
       if (parts.length === 0 && rows.length === 0 && !photoHtml) {
-        section.innerHTML = '';
+        setTrustedHtml(section, trustedHtml('', "legacy direct innerHTML migration"));
         return;
       }
 
       const statsHtml = rows.length > 0 ? `<div class="popup-stats">${rows.join('')}</div>` : '';
-      section.innerHTML = `
+      setTrustedHtml(section, trustedHtml(`
         <div class="popup-section-label" style="font-size:10px;opacity:0.5;text-transform:uppercase;letter-spacing:.05em;margin-top:8px">Live Data</div>
         ${parts.join('')}
         ${statsHtml}
         ${photoHtml}
-      `;
+      `, "legacy direct innerHTML migration"));
       // Clamp for text content immediately, then re-clamp once the photo is sized.
       this.clampPopupToViewport();
       if (photoHtml) {
@@ -1184,7 +1249,7 @@ export class MapPopup {
       }
     } catch {
       if (section.isConnected) {
-        section.innerHTML = '';
+        setTrustedHtml(section, trustedHtml('', "legacy direct innerHTML migration"));
       }
     }
   }
@@ -1461,6 +1526,7 @@ export class MapPopup {
     const actorsSection = event.actors?.length
       ? `<div class="popup-stat"><span class="stat-label">${t('popups.actors')}</span><span class="stat-value">${event.actors.map(a => escapeHtml(a)).join(', ')}</span></div>`
       : '';
+    const sourceLinks = renderPopupSourceLinks(event.sourceUrls, { label: t('popups.source') });
     const tagsSection = event.tags?.length
       ? `<div class="popup-tags">${event.tags.map(t => `<span class="popup-tag">${escapeHtml(t)}</span>`).join('')}</div>`
       : '';
@@ -1491,6 +1557,7 @@ export class MapPopup {
           ${actorsSection}
         </div>
         ${event.title ? `<p class="popup-description">${escapeHtml(event.title)}</p>` : ''}
+        ${sourceLinks}
         ${tagsSection}
         ${relatedHotspots}
       </div>
@@ -1518,7 +1585,11 @@ export class MapPopup {
       const dateStr = event.time.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
       const city = event.city ? escapeHtml(event.city) : '';
       const title = event.title ? `: ${escapeHtml(event.title.slice(0, 40))}${event.title.length > 40 ? '...' : ''}` : '';
-      return `<li class="cluster-item ${sevClass}">${icon} ${dateStr}${city ? ` • ${city}` : ''}${title}</li>`;
+      const sourceUrl = event.sourceUrls?.find(url => sanitizeUrl(url));
+      const sourceLink = sourceUrl
+        ? ` <a class="popup-link cluster-source-link" href="${sanitizeUrl(sourceUrl)}" target="_blank" rel="noopener noreferrer nofollow">${t('popups.source')} →</a>`
+        : '';
+      return `<li class="cluster-item ${sevClass}">${icon} ${dateStr}${city ? ` • ${city}` : ''}${title}${sourceLink}</li>`;
     }).join('');
 
     const renderedCount = Math.min(10, data.items.length);
@@ -1547,7 +1618,11 @@ export class MapPopup {
 
   private renderFlightPopup(delay: AirportDelayAlert): string {
     const severityClass = escapeHtml(delay.severity);
-    const severityLabel = escapeHtml(delay.severity.toUpperCase());
+    // #3707: render 'unknown' as a neutral "No data" badge so users don't
+    // read it as "healthy / normal". All other severities keep raw label.
+    const severityLabel = delay.severity === 'unknown'
+      ? 'NO DATA'
+      : escapeHtml(delay.severity.toUpperCase());
     const delayTypeLabels: Record<string, string> = {
       'ground_stop': t('popups.flight.groundStop'),
       'ground_delay': t('popups.flight.groundDelay'),
@@ -1556,14 +1631,23 @@ export class MapPopup {
       'general': t('popups.flight.delaysReported'),
       'closure': t('popups.flight.closure'),
     };
-    const delayTypeLabel = delayTypeLabels[delay.delayType] || t('popups.flight.delays');
-    const icon = delay.delayType === 'closure' ? '🚫' : delay.delayType === 'ground_stop' ? '🛑' : delay.severity === 'severe' ? '✈️' : '🛫';
+    // #3707: when severity is 'unknown' we have no delay-type signal either.
+    const delayTypeLabel = delay.severity === 'unknown'
+      ? 'Coverage unavailable'
+      : (delayTypeLabels[delay.delayType] || t('popups.flight.delays'));
+    const icon = delay.severity === 'unknown'
+      ? '❔'
+      : delay.delayType === 'closure' ? '🚫'
+      : delay.delayType === 'ground_stop' ? '🛑'
+      : delay.severity === 'severe' ? '✈️'
+      : '🛫';
     const sourceLabels: Record<string, string> = {
       'faa': t('popups.flight.sources.faa'),
       'eurocontrol': t('popups.flight.sources.eurocontrol'),
       'computed': t('popups.flight.sources.computed'),
       'aviationstack': t('popups.flight.sources.aviationstack'),
       'notam': t('popups.flight.sources.notam'),
+      'unspecified': '—',
     };
     const sourceLabel = sourceLabels[delay.source] || escapeHtml(delay.source);
     const regionLabels: Record<string, string> = {
@@ -1756,6 +1840,8 @@ ${isFeatureAvailable('wingbitsEnrichment') ? '<div class="wingbits-live-section"
       'enrichment': t('popups.nuclear.types.enrichment'),
       'weapons': t('popups.nuclear.types.weapons'),
       'research': t('popups.nuclear.types.research'),
+      'reprocessing': t('popups.nuclear.types.reprocessing'),
+      'test-site': t('popups.nuclear.types.testSite'),
     };
     const statusColors: Record<string, string> = {
       'active': 'elevated',
@@ -1785,6 +1871,34 @@ ${isFeatureAvailable('wingbitsEnrichment') ? '<div class="wingbits-live-section"
           </div>
         </div>
         <p class="popup-description">${t('popups.nuclear.description')}</p>
+        ${(facility.operationalSince || facility.treaties?.length || facility.iaeaStatus || facility.keyEvents?.length) ? `
+        <div class="popup-section">
+          <details>
+            <summary>📜 HISTORICAL PROFILE</summary>
+            <div class="popup-section-content">
+              ${facility.operationalSince ? `
+              <div class="popup-stat">
+                <span class="stat-label">OPERATIONAL SINCE</span>
+                <span class="stat-value">${escapeHtml(facility.operationalSince)}</span>
+              </div>` : ''}
+              ${facility.treaties?.length ? `
+              <div class="popup-stat">
+                <span class="stat-label">TREATIES</span>
+                <span class="stat-value">${facility.treaties.map(escapeHtml).join(', ')}</span>
+              </div>` : ''}
+              ${facility.iaeaStatus ? `
+              <div class="popup-stat">
+                <span class="stat-label">IAEA STATUS</span>
+                <span class="stat-value">${escapeHtml(facility.iaeaStatus)}</span>
+              </div>` : ''}
+              ${facility.keyEvents?.length ? `
+              <div class="popup-stat">
+                <span class="stat-label">KEY EVENTS</span>
+                <span class="stat-value">${facility.keyEvents.map(escapeHtml).join('<br>')}</span>
+              </div>` : ''}
+            </div>
+          </details>
+        </div>` : ''}
       </div>
     `;
   }
@@ -3046,7 +3160,7 @@ ${isFeatureAvailable('wingbitsEnrichment') ? '<div class="wingbits-live-section"
           </div>
           ` : ''}
         </div>
-        ${event.stormName || event.windKt ? this.renderTcDetails(event) : ''}
+        ${event.stormName || event.windKt || event.agencyObservations?.length ? this.renderTcDetails(event) : ''}
         ${event.description && !event.windKt ? `<p class="popup-description">${escapeHtml(event.description)}</p>` : ''}
         ${event.sourceUrl ? `<a href="${sanitizeUrl(event.sourceUrl)}" target="_blank" class="popup-link">${t('popups.naturalEvent.viewOnSource', { source: escapeHtml(event.sourceName || t('popups.source')) })} →</a>` : ''}
         <div class="popup-attribution">${t('popups.naturalEvent.attribution')}</div>
@@ -3061,6 +3175,16 @@ ${isFeatureAvailable('wingbitsEnrichment') ? '<div class="wingbits-live-section"
     const cat = event.stormCategory ?? 0;
     const color = TC_COLORS[cat] || TC_COLORS[0];
     const catLabel = event.classification || (cat > 0 ? `Category ${cat}` : t('popups.naturalEvent.tropicalSystem'));
+    const agencyObservations = event.agencyObservations ?? [];
+    const agencyObservationRows = agencyObservations.map((observation) => {
+      const wind = observation.windKt != null
+        ? `${observation.windKt} kt${observation.windAveragingPeriodMinutes ? ` (${observation.windAveragingPeriodMinutes}-minute mean)` : ''}`
+        : 'Wind not reported';
+      const name = observation.sourceName || observation.agency;
+      const agencyId = observation.agencyId ? ` · ${observation.agencyId}` : '';
+      const status = observation.status ? ` · ${observation.status}` : '';
+      return `<div class="popup-stat" style="grid-column: 1 / -1"><span class="stat-label">${escapeHtml(name)}${escapeHtml(agencyId)}</span><span class="stat-value">${escapeHtml(wind + status)}</span></div>`;
+    }).join('');
 
     return `
       <div class="popup-stats">
@@ -3078,6 +3202,16 @@ ${isFeatureAvailable('wingbitsEnrichment') ? '<div class="wingbits-live-section"
           <span class="stat-label">${t('popups.naturalEvent.maxWind')}</span>
           <span class="stat-value">${event.windKt} kt (${Math.round(event.windKt * 1.15078)} mph)</span>
         </div>` : ''}
+        ${event.windAveragingPeriodMinutes != null ? `
+        <div class="popup-stat">
+          <span class="stat-label">Wind average</span>
+          <span class="stat-value">${event.windAveragingPeriodMinutes}-minute mean</span>
+        </div>` : ''}
+        ${event.canonicalId ? `
+        <div class="popup-stat">
+          <span class="stat-label">Canonical match</span>
+          <span class="stat-value">${escapeHtml(event.matchingConfidence || 'Agency identifier')}</span>
+        </div>` : ''}
         ${event.pressureMb != null ? `
         <div class="popup-stat">
           <span class="stat-label">${t('popups.naturalEvent.pressure')}</span>
@@ -3088,6 +3222,12 @@ ${isFeatureAvailable('wingbitsEnrichment') ? '<div class="wingbits-live-section"
           <span class="stat-label">${t('popups.naturalEvent.movement')}</span>
           <span class="stat-value">${event.movementDir != null ? event.movementDir + '° at ' : ''}${event.movementSpeedKt} kt</span>
         </div>` : ''}
+        ${agencyObservations.length > 0 ? `
+        <div class="popup-stat" style="grid-column: 1 / -1">
+          <span class="stat-label">Agency observations</span>
+          <span class="stat-value">${agencyObservations.length}</span>
+        </div>
+        ${agencyObservationRows}` : ''}
       </div>
     `;
   }
@@ -3399,15 +3539,15 @@ ${isFeatureAvailable('wingbitsEnrichment') ? '<div class="wingbits-live-section"
         <div class="popup-stats">
           <div class="popup-stat">
             <span class="stat-label">${t('popups.gpsJamming.navPerformance')}</span>
-            <span class="stat-value">${Number(data.npAvg).toFixed(2)}</span>
+            <span class="stat-value">${Number(data.pct).toFixed(1)}%</span>
           </div>
           <div class="popup-stat">
             <span class="stat-label">${t('popups.gpsJamming.samples')}</span>
-            <span class="stat-value">${data.sampleCount}</span>
+            <span class="stat-value">${data.affectedAircraft}</span>
           </div>
           <div class="popup-stat">
             <span class="stat-label">${t('popups.gpsJamming.aircraft')}</span>
-            <span class="stat-value">${data.aircraftCount}</span>
+            <span class="stat-value">${data.totalAircraft}</span>
           </div>
           <div class="popup-stat">
             <span class="stat-label">${t('popups.gpsJamming.h3Hex')}</span>

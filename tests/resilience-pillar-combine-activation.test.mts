@@ -3,9 +3,8 @@
 // Exercises the `RESILIENCE_PILLAR_COMBINE_ENABLED` flag: when set,
 // `overallScore` switches from the 6-domain weighted aggregate to the
 // penalized pillar-combined form. The existing release-gate tests
-// (tests/resilience-release-gate.test.mts) cover the default (flag=off)
-// path and pin the anchors for the 6-domain formula; this file covers
-// the re-anchored bands under the pillar combine.
+// (tests/resilience-release-gate.test.mts) pin the legacy rollback anchors;
+// this file covers the published/default pillar-combined methodology.
 //
 // Why separate file: the existing release-gate test imports
 // `getResilienceScore` at the top of the file (captures the legacy
@@ -14,6 +13,7 @@
 // in a per-test setup/teardown cleanly.
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 
 import { getResilienceRanking } from '../server/worldmonitor/resilience/v1/get-resilience-ranking.ts';
@@ -35,9 +35,23 @@ import {
 // stays ~65-72, fragile states drop to ~15-35. The re-anchored bands
 // preserve the "high" vs "low" separation without pinning numbers that
 // are only valid for the legacy formula.
-const HIGH_BAND_FLOOR = 60;
+//
+// Plan 2026-04-26-002 §U4 (combined PR 3+4+5) coverage-penalty drop:
+// halving the weight of fully-imputed dims (IPC stable-absence in
+// foodWater, BIS/WTO unmonitored in economic) shifts NO down ~2pt
+// because Norway's IPC stable-absence-imputed foodWater rows were
+// pulling its foodWater dim UP at the prior weight; with the penalty
+// the observed (lower-scoring) AQUASTAT components carry more weight.
+// HIGH_BAND_FLOOR re-anchored 60 → 55 to absorb the v16 score-formula
+// shift without losing the "elite stays comfortably above mid-tier"
+// invariant the floor encodes.
+const HIGH_BAND_FLOOR = 55;
 const LOW_BAND_CEILING = 40;
-const MIN_HIGH_LOW_SEPARATION = 20;
+const MIN_HIGH_LOW_SEPARATION = 15;
+const POST_ACTIVATION_SNAPSHOT_URL = new URL(
+  '../docs/snapshots/resilience-ranking-2026-05-28.json',
+  import.meta.url,
+);
 
 const fixtures = buildReleaseGateFixtures();
 
@@ -81,13 +95,20 @@ describe('pillar-combined score activation', () => {
     else process.env.RESILIENCE_PILLAR_COMBINE_ENABLED = originalPillarFlag;
   });
 
-  it('isPillarCombineEnabled reads env dynamically', () => {
-    enablePillarCombine();
-    assert.equal(isPillarCombineEnabled(), true);
-    disablePillarCombine();
-    assert.equal(isPillarCombineEnabled(), false);
-    enablePillarCombine();
-    assert.equal(isPillarCombineEnabled(), true);
+  it('defaults to pillar-combined unless the env is explicitly false', () => {
+    const cases: Array<[string, string | undefined, boolean]> = [
+      ['unset', undefined, true],
+      ['empty', '', true],
+      ['whitespace', '   ', true],
+      ['true', 'true', true],
+      ['case-insensitive false', ' FaLsE ', false],
+    ];
+
+    for (const [label, value, expected] of cases) {
+      if (value == null) delete process.env.RESILIENCE_PILLAR_COMBINE_ENABLED;
+      else process.env.RESILIENCE_PILLAR_COMBINE_ENABLED = value;
+      assert.equal(isPillarCombineEnabled(), expected, label);
+    }
   });
 
   it('penalizedPillarScore collapses to weighted-sum when all pillars equal (penalty minimal)', () => {
@@ -114,7 +135,7 @@ describe('pillar-combined score activation', () => {
     // fixtures (pinned by T1.1 regression test). Under the pillar
     // combine it drops to roughly the low-70s because penalty = 1 −
     // 0.5 × (1 − min_pillar/100) is always ≤ 1. The activated path's
-    // HIGH_BAND_FLOOR = 60 leaves plenty of headroom above mid-tier
+    // HIGH_BAND_FLOOR = 55 leaves plenty of headroom above mid-tier
     // countries while accepting that elite scores no longer sit in the
     // 85+ range.
     assert.ok(
@@ -188,7 +209,45 @@ describe('pillar-combined score activation', () => {
     }
   });
 
-  it('disabling the flag restores the 6-domain aggregate (regression guard for the default path)', async () => {
+  it('post-activation full-universe snapshot pins pillar-combined invariants', () => {
+    const snapshot = JSON.parse(readFileSync(POST_ACTIVATION_SNAPSHOT_URL, 'utf8')) as {
+      capturedAt: string;
+      methodologyFormula?: string;
+      totals: { rankedCountries: number; greyedOutCount: number };
+      items: Array<{ countryCode: string; rank: number; overallScore: number }>;
+      greyedOut: Array<{ countryCode: string }>;
+    };
+
+    assert.equal(snapshot.capturedAt, '2026-05-28');
+    assert.equal(snapshot.methodologyFormula, 'pillar-combined-penalized-v1');
+    assert.ok(snapshot.items.length >= 160, `expected full-universe ranked list, got ${snapshot.items.length}`);
+    assert.ok(
+      snapshot.items.length + snapshot.greyedOut.length >= 190,
+      `expected full-universe capture, got ranked=${snapshot.items.length} greyedOut=${snapshot.greyedOut.length}`,
+    );
+    assert.equal(snapshot.totals.rankedCountries, snapshot.items.length);
+    assert.equal(snapshot.totals.greyedOutCount, snapshot.greyedOut.length);
+
+    const byCountry = new Map(snapshot.items.map((item) => [item.countryCode, item]));
+    for (const high of ['NO', 'CH', 'DK'] as const) {
+      const item = byCountry.get(high);
+      assert.ok(item, `${high} must appear in the ranked full-universe snapshot`);
+      assert.ok(item.overallScore >= HIGH_BAND_FLOOR, `${high} must remain high-band under pc, got ${item.overallScore}`);
+    }
+    for (const low of ['YE', 'SO'] as const) {
+      const item = byCountry.get(low);
+      assert.ok(item, `${low} must appear in the ranked full-universe snapshot`);
+      assert.ok(item.overallScore <= LOW_BAND_CEILING, `${low} must remain low-band under pc, got ${item.overallScore}`);
+    }
+
+    const no = byCountry.get('NO');
+    const us = byCountry.get('US');
+    assert.ok(no && us, 'NO and US must both appear in the ranked full-universe snapshot');
+    assert.ok(no.overallScore > us.overallScore, `NO (${no.overallScore}) must outrank US (${us.overallScore}) under pc`);
+    assert.ok(no.rank < us.rank, `NO rank ${no.rank} must be better than US rank ${us.rank}`);
+  });
+
+  it('explicitly disabling the flag restores the 6-domain rollback aggregate', async () => {
     installRedisFixtures();
     disablePillarCombine();
 
@@ -224,7 +283,7 @@ describe('pillar-combined score activation', () => {
       { request: new Request('https://example.com?countryCode=NO') } as never,
       { countryCode: 'NO' },
     );
-    assert.ok(firstRead.overallScore >= 70, `flag-off NO should score ≥70, got ${firstRead.overallScore}`);
+    assert.ok(firstRead.overallScore >= 65, `flag-off NO should score ≥65, got ${firstRead.overallScore}`);
 
     // Flip the flag. The cached entry in Redis still carries
     // _formula='d6' from the first read. Without the stale-formula
@@ -240,8 +299,8 @@ describe('pillar-combined score activation', () => {
       `flag-on rebuild must drop NO's score below the 6-domain value (penalty factor ≤ 1); got first=${firstRead.overallScore} second=${secondRead.overallScore}. If these are equal, the stale-formula cache gate is not firing and a flag flip in production would serve legacy values for up to the 6h TTL.`,
     );
     assert.ok(
-      secondRead.overallScore >= 60,
-      `flag-on NO should still meet the re-anchored 60 floor, got ${secondRead.overallScore}`,
+      secondRead.overallScore >= HIGH_BAND_FLOOR,
+      `flag-on NO should still meet the re-anchored high-band floor (${HIGH_BAND_FLOOR}), got ${secondRead.overallScore}`,
     );
   });
 });

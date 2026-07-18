@@ -2,12 +2,15 @@ import { useState, useEffect, useCallback } from 'react';
 import { motion } from 'motion/react';
 import { Check, ArrowRight, Zap, Loader2 } from 'lucide-react';
 import { startCheckout, subscribeCheckoutPhase, type CheckoutPhase } from '../services/checkout';
+import { t, tArray } from '../i18n';
 
 // Static fallback from build-time generation (used while fetching live prices)
 import fallbackTiers from '../generated/tiers.json';
+import { resolveCheckoutProduct } from './pricing-billing-mode';
 
 interface Tier {
   name: string;
+  localeKey?: string;
   description: string;
   features: string[];
   highlighted?: boolean;
@@ -42,29 +45,47 @@ function usePricingData(): Tier[] {
   return tiers;
 }
 
+/**
+ * Look up localized copy for a catalog tier, falling back to the catalog
+ * value when the locale hasn't translated this tier yet. Generated tiers
+ * carry a stable localeKey so display-name changes do not affect lookup.
+ */
+function localizeTier(tier: Tier): { description: string; features: string[]; cta?: string } {
+  const key = tier.localeKey ?? tier.name.toLowerCase();
+  const description = t(`pricing.tiers.${key}.description`, { defaultValue: tier.description });
+  const features = tArray(`pricing.tiers.${key}.features`) ?? tier.features;
+  // Resolve CTA priority: locale-specific tier override → catalog tier.cta →
+  // undefined (so getCtaProps applies the generic localized fallback). The
+  // SENTINEL trick lets us detect "key missing" vs "key resolves to empty".
+  const SENTINEL = '__no_locale_cta__';
+  const localeCta = t(`pricing.tiers.${key}.cta`, { defaultValue: SENTINEL });
+  const cta = localeCta !== SENTINEL ? localeCta : tier.cta;
+  return { description, features, cta };
+}
+
 function formatPrice(tier: Tier, billing: 'monthly' | 'annual'): { amount: string; suffix: string } {
   // Free tier
   if (tier.price === 0) {
-    return { amount: "$0", suffix: "forever" };
+    return { amount: "$0", suffix: t('pricing.suffixForever') };
   }
   // Enterprise / custom
   if (tier.price === null && tier.monthlyPrice === undefined) {
-    return { amount: "Custom", suffix: "tailored to you" };
+    return { amount: t('pricing.amountCustom'), suffix: t('pricing.suffixTailored') };
   }
   // API tier (monthly only)
   if (tier.annualPrice === null && tier.monthlyPrice !== undefined) {
-    return { amount: `$${tier.monthlyPrice}`, suffix: "/mo" };
+    return { amount: `$${tier.monthlyPrice}`, suffix: t('pricing.suffixPerMonth') };
   }
   // Pro tier with toggle
   if (billing === 'annual' && tier.annualPrice != null) {
-    return { amount: `$${tier.annualPrice}`, suffix: "/yr" };
+    return { amount: `$${tier.annualPrice}`, suffix: t('pricing.suffixPerYear') };
   }
-  return { amount: `$${tier.monthlyPrice}`, suffix: "/mo" };
+  return { amount: `$${tier.monthlyPrice}`, suffix: t('pricing.suffixPerMonth') };
 }
 
 type CtaProps =
   | { type: 'link'; label: string; href: string; external: boolean }
-  | { type: 'checkout'; label: string; productId: string };
+  | { type: 'checkout'; label: string; productId: string; billedMonthlyOnly: boolean };
 
 /**
  * Is this href pointing back at our own product surface (so a
@@ -123,13 +144,23 @@ function getCtaProps(tier: Tier, billing: 'monthly' | 'annual'): CtaProps {
       external: !isInProductHref(tier.href),
     };
   }
-  if (tier.monthlyProductId) {
-    const productId = (billing === 'annual' && tier.annualProductId) ? tier.annualProductId : tier.monthlyProductId;
+  const resolved = resolveCheckoutProduct(tier, billing);
+  if (resolved) {
     // Honor per-tier CTA text from the catalog (e.g. "Start Pro",
-    // "Subscribe") when present; fall back to the generic label.
-    return { type: 'checkout', label: tier.cta ?? 'Get Started', productId };
+    // "Subscribe") when present; fall back to a localized generic label
+    // so paid checkout buttons aren't English-only on non-English locales.
+    // billedMonthlyOnly (#4946 round 4): with the page toggle on Annual, a
+    // monthly-only tier (API Business) still checks out its monthly product
+    // — the card renders an explicit "billed monthly" note so entering
+    // checkout from an annual-selected state is never a silent surprise.
+    return {
+      type: 'checkout',
+      label: tier.cta ?? t('pricing.cta.checkoutDefault'),
+      productId: resolved.productId,
+      billedMonthlyOnly: resolved.billedMonthlyOnly,
+    };
   }
-  return { type: 'link', label: 'Learn More', href: '#', external: false };
+  return { type: 'link', label: t('pricing.cta.learnMore'), href: '#', external: false };
 }
 
 export function PricingSection({ refCode }: { refCode?: string }) {
@@ -164,7 +195,7 @@ export function PricingSection({ refCode }: { refCode?: string }) {
             viewport={{ once: true }}
             transition={{ duration: 0.5 }}
           >
-            Choose Your Plan
+            {t('pricing.headerTitle')}
           </motion.h2>
           <motion.p
             className="text-wm-muted max-w-xl mx-auto mb-8"
@@ -173,8 +204,7 @@ export function PricingSection({ refCode }: { refCode?: string }) {
             viewport={{ once: true }}
             transition={{ duration: 0.5, delay: 0.1 }}
           >
-            From real-time monitoring to full intelligence infrastructure.
-            Pick the tier that fits your mission.
+            {t('pricing.headerSubtitle')}
           </motion.p>
 
           {/* Billing toggle — disabled while a checkout is active.
@@ -199,7 +229,7 @@ export function PricingSection({ refCode }: { refCode?: string }) {
                   : 'text-wm-muted hover:text-wm-text'
               }`}
             >
-              Monthly
+              {t('pricing.billingMonthly')}
             </button>
             <button
               onClick={() => setBilling('annual')}
@@ -214,23 +244,29 @@ export function PricingSection({ refCode }: { refCode?: string }) {
                   post-auth window). Through the Clerk modal the toggle
                   is covered by the backdrop anyway; locking during the
                   modal was unnecessary. */}
-              Annual
+              {t('pricing.billingAnnual')}
               <span className={`text-[10px] px-1.5 py-0.5 rounded-sm ${
                 billing === 'annual'
                   ? 'bg-wm-bg/20 text-wm-bg'
                   : 'bg-wm-green/10 text-wm-green'
               }`}>
-                Save 17%
+                {t('pricing.saveAnnual')}
               </span>
             </button>
           </motion.div>
         </div>
 
         {/* Tier cards grid */}
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+        {/* 5 tiers since API Business was published (#4945): 2-up on tablet,
+            3+2 on laptop, all five across on desktop. */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-6">
           {TIERS.map((tier, i) => {
             const price = formatPrice(tier, billing);
-            const cta = getCtaProps(tier, billing);
+            const localized = localizeTier(tier);
+            // Build a localized tier shape so getCtaProps picks the right
+            // CTA label per locale (link CTAs read tier.cta directly).
+            const localizedTier: Tier = { ...tier, cta: localized.cta };
+            const cta = getCtaProps(localizedTier, billing);
 
             return (
               <motion.div
@@ -249,7 +285,7 @@ export function PricingSection({ refCode }: { refCode?: string }) {
                 {tier.highlighted && (
                   <div className="absolute -top-3 left-1/2 -translate-x-1/2 inline-flex items-center gap-1 bg-wm-green text-wm-bg px-3 py-1 rounded-full text-xs font-mono font-bold uppercase tracking-wider">
                     <Zap className="w-3 h-3" aria-hidden="true" />
-                    Most Popular
+                    {t('pricing.mostPopular')}
                   </div>
                 )}
 
@@ -261,17 +297,22 @@ export function PricingSection({ refCode }: { refCode?: string }) {
                 </h3>
 
                 {/* Description */}
-                <p className="text-xs text-wm-muted mb-4">{tier.description}</p>
+                <p className="text-xs text-wm-muted mb-4">{localized.description}</p>
 
                 {/* Price */}
                 <div className="mb-6">
                   <span className="text-4xl font-display font-bold">{price.amount}</span>
-                  <span className="text-sm text-wm-muted ml-1">/{price.suffix}</span>
+                  <span className="text-sm text-wm-muted ml-1">{price.suffix}</span>
+                  {cta.type === 'checkout' && cta.billedMonthlyOnly && (
+                    <p className="mt-1 text-[11px] font-mono uppercase tracking-wider text-wm-muted">
+                      {t('pricing.billedMonthlyNote', { defaultValue: 'Billed monthly — no annual plan' })}
+                    </p>
+                  )}
                 </div>
 
                 {/* Features */}
                 <ul className="space-y-3 mb-8 flex-1">
-                  {tier.features.map((feature, fi) => (
+                  {localized.features.map((feature, fi) => (
                     <li key={fi} className="flex items-start gap-2 text-sm">
                       <Check className={`w-4 h-4 shrink-0 mt-0.5 ${
                         tier.highlighted ? 'text-wm-green' : 'text-wm-muted'
@@ -317,7 +358,7 @@ export function PricingSection({ refCode }: { refCode?: string }) {
                       {isLoading ? (
                         <>
                           <Loader2 className="w-3.5 h-3.5 inline-block mr-2 animate-spin" aria-hidden="true" />
-                          <span>Opening…</span>
+                          <span>{t('pricing.opening')}</span>
                         </>
                       ) : (
                         <>
@@ -334,7 +375,7 @@ export function PricingSection({ refCode }: { refCode?: string }) {
 
         {/* Discount code note */}
         <p className="text-center text-xs text-wm-muted font-mono mt-8">
-          Have a promo code? Enter it during checkout.
+          {t('pricing.promoCodeNote')}
         </p>
       </div>
     </section>

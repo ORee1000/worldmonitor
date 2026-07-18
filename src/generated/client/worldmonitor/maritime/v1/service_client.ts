@@ -7,10 +7,13 @@ export interface GetVesselSnapshotRequest {
   swLat: number;
   swLon: number;
   includeCandidates: boolean;
+  includeTankers: boolean;
 }
 
 export interface GetVesselSnapshotResponse {
   snapshot?: VesselSnapshot;
+  fetchedAt: number;
+  dataAvailable: boolean;
 }
 
 export interface VesselSnapshot {
@@ -20,6 +23,7 @@ export interface VesselSnapshot {
   sequence: number;
   status?: AisSnapshotStatus;
   candidateReports: SnapshotCandidateReport[];
+  tankerReports: SnapshotCandidateReport[];
 }
 
 export interface AisDensityZone {
@@ -156,6 +160,7 @@ export class MaritimeServiceClient {
     if (req.swLat != null && req.swLat !== 0) params.set("sw_lat", String(req.swLat));
     if (req.swLon != null && req.swLon !== 0) params.set("sw_lon", String(req.swLon));
     if (req.includeCandidates) params.set("include_candidates", String(req.includeCandidates));
+    if (req.includeTankers) params.set("include_tankers", String(req.includeTankers));
     const url = this.baseURL + path + (params.toString() ? "?" + params.toString() : "");
 
     const headers: Record<string, string> = {

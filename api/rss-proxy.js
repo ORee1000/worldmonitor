@@ -2,8 +2,9 @@ import { getCorsHeaders, isDisallowedOrigin } from './_cors.js';
 import { validateApiKey } from './_api-key.js';
 import { checkRateLimit } from './_rate-limit.js';
 import { getRelayBaseUrl, getRelayHeaders, fetchWithTimeout } from './_relay.js';
-import RSS_ALLOWED_DOMAINS from './_rss-allowed-domains.js';
+import { isAllowedDomain } from './_rss-allowed-domain-match.js';
 import { jsonResponse } from './_json-response.js';
+import { captureSilentError } from './_sentry-edge.js';
 
 export const config = { runtime: 'edge' };
 
@@ -35,6 +36,16 @@ const DIRECT_FETCH_HEADERS = Object.freeze({
   'Accept': 'application/rss+xml, application/xml, text/xml, */*',
   'Accept-Language': 'en-US,en;q=0.9',
 });
+const DIRECT_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+const MAX_DIRECT_REDIRECTS = 3;
+
+class RssProxyPolicyError extends Error {
+  constructor(message, status = 403) {
+    super(message);
+    this.name = 'RssProxyPolicyError';
+    this.status = status;
+  }
+}
 
 async function fetchViaRailway(feedUrl, timeoutMs) {
   const relayBaseUrl = getRelayBaseUrl();
@@ -48,14 +59,9 @@ async function fetchViaRailway(feedUrl, timeoutMs) {
   }, timeoutMs);
 }
 
-// Allowed RSS feed domains — shared source of truth (shared/rss-allowed-domains.js)
-const ALLOWED_DOMAINS = RSS_ALLOWED_DOMAINS;
-
-function isAllowedDomain(hostname) {
-  const bare = hostname.replace(/^www\./, '');
-  const withWww = hostname.startsWith('www.') ? hostname : `www.${hostname}`;
-  return ALLOWED_DOMAINS.includes(hostname) || ALLOWED_DOMAINS.includes(bare) || ALLOWED_DOMAINS.includes(withWww);
-}
+// Allowlist + match predicate live in api/_rss-allowed-domain-match.js
+// (shared with scripts/validate-rss-feeds.mjs --ci so the SSRF guard runs
+// identically in the Edge handler and the build-time validator).
 
 function isGoogleNewsFeedUrl(feedUrl) {
   try {
@@ -65,7 +71,23 @@ function isGoogleNewsFeedUrl(feedUrl) {
   }
 }
 
-export default async function handler(req) {
+function assertHttpProtocol(url, message = 'URL protocol not allowed', status = 400) {
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new RssProxyPolicyError(message, status);
+  }
+}
+
+function assertAllowedRedirect(url) {
+  assertHttpProtocol(url, 'Redirect protocol not allowed', 403);
+  // Apply the same www-normalization as the initial domain check so that
+  // canonical redirects (e.g. apex -> www) are not incorrectly rejected when
+  // only one form is in the allowlist.
+  if (!isAllowedDomain(url.hostname)) {
+    throw new RssProxyPolicyError('Redirect to disallowed domain');
+  }
+}
+
+export default async function handler(req, ctx) {
   const corsHeaders = getCorsHeaders(req, 'GET, OPTIONS');
 
   if (isDisallowedOrigin(req)) {
@@ -80,7 +102,7 @@ export default async function handler(req) {
     return jsonResponse({ error: 'Method not allowed' }, 405, corsHeaders);
   }
 
-  const keyCheck = validateApiKey(req);
+  const keyCheck = await validateApiKey(req);
   if (keyCheck.required && !keyCheck.valid) {
     return jsonResponse({ error: keyCheck.error }, 401, corsHeaders);
   }
@@ -95,8 +117,20 @@ export default async function handler(req) {
     return jsonResponse({ error: 'Missing url parameter' }, 400, corsHeaders);
   }
 
+  // A malformed `url` param is a client error, not a server fault. Parse it up
+  // front and return 400 WITHOUT a Sentry capture — otherwise `new URL()` throws
+  // "Invalid URL string." inside the try below, which the catch reports as an
+  // error-level exception and answers with a 502 (WORLDMONITOR-TT: 21 events from
+  // malformed/double-encoded feed params).
+  let parsedUrl;
   try {
-    const parsedUrl = new URL(feedUrl);
+    parsedUrl = new URL(feedUrl);
+  } catch {
+    return jsonResponse({ error: 'Invalid url parameter' }, 400, corsHeaders);
+  }
+
+  try {
+    assertHttpProtocol(parsedUrl);
 
     // Security: Check if domain is allowed (normalize www prefix)
     const hostname = parsedUrl.hostname;
@@ -111,29 +145,31 @@ export default async function handler(req) {
     const timeout = isGoogleNews ? 20000 : 12000;
 
     const fetchDirect = async () => {
-      const response = await fetchWithTimeout(feedUrl, {
-        headers: DIRECT_FETCH_HEADERS,
-        redirect: 'manual',
-      }, timeout);
+      let currentUrl = parsedUrl;
 
-      if (response.status >= 300 && response.status < 400) {
-        const location = response.headers.get('location');
-        if (location) {
-          const redirectUrl = new URL(location, feedUrl);
-          // Apply the same www-normalization as the initial domain check so that
-          // canonical redirects (e.g. bbc.co.uk → www.bbc.co.uk) are not
-          // incorrectly rejected when only one form is in the allowlist.
-          const rHost = redirectUrl.hostname;
-          if (!isAllowedDomain(rHost)) {
-            throw new Error('Redirect to disallowed domain');
-          }
-          return fetchWithTimeout(redirectUrl.href, {
-            headers: DIRECT_FETCH_HEADERS,
-          }, timeout);
+      for (let redirectCount = 0; redirectCount <= MAX_DIRECT_REDIRECTS; redirectCount += 1) {
+        const response = await fetchWithTimeout(currentUrl.href, {
+          headers: DIRECT_FETCH_HEADERS,
+          redirect: 'manual',
+        }, timeout);
+
+        if (!DIRECT_REDIRECT_STATUSES.has(response.status)) {
+          return response;
         }
-      }
 
-      return response;
+        const location = response.headers.get('location');
+        if (!location) {
+          return response;
+        }
+
+        if (redirectCount === MAX_DIRECT_REDIRECTS) {
+          throw new RssProxyPolicyError('Too many redirects', 502);
+        }
+
+        const redirectUrl = new URL(location, currentUrl.href);
+        assertAllowedRedirect(redirectUrl);
+        currentUrl = redirectUrl;
+      }
     };
 
     let response;
@@ -148,6 +184,7 @@ export default async function handler(req) {
       try {
         response = await fetchDirect();
       } catch (directError) {
+        if (directError instanceof RssProxyPolicyError) throw directError;
         response = await fetchViaRailway(feedUrl, timeout);
         usedRelay = !!response;
         if (!response) throw directError;
@@ -180,8 +217,17 @@ export default async function handler(req) {
       },
     });
   } catch (error) {
+    if (error instanceof RssProxyPolicyError) {
+      return jsonResponse({ error: error.message }, error.status, corsHeaders);
+    }
+
     const isTimeout = error.name === 'AbortError';
     console.error('RSS proxy error:', feedUrl, error.message);
+    // Skip Sentry capture on timeout — Sentry would drown in transient
+    // upstream-feed timeouts which are routine. Only surface "real" errors.
+    if (!isTimeout) {
+      captureSilentError(error, { tags: { route: 'api/rss-proxy', step: 'fetch', feed: feedUrl }, ctx });
+    }
     return jsonResponse({
       error: isTimeout ? 'Feed timeout' : 'Failed to fetch feed',
       details: error.message,

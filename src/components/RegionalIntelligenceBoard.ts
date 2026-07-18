@@ -1,19 +1,21 @@
 import { Panel } from './Panel';
-import { getRpcBaseUrl } from '@/services/rpc-client';
+import { createLazyClient, getRpcBaseUrl } from '@/services/rpc-client';
 import { premiumFetch } from '@/services/premium-fetch';
 import { IS_EMBEDDED_PREVIEW } from '@/utils/embedded-preview';
 import { hasPremiumAccess } from '@/services/panel-gating';
 import { subscribeAuthState } from '@/services/auth-state';
-import { IntelligenceServiceClient } from '@/generated/client/worldmonitor/intelligence/v1/service_client';
+import { onEntitlementChange } from '@/services/entitlements';
+
 import type { RegionalSnapshot, RegimeTransition, RegionalBrief } from '@/generated/client/worldmonitor/intelligence/v1/service_client';
-import { h, replaceChildren } from '@/utils/dom-utils';
+import { h, replaceChildren, setTrustedHtml, trustedHtml } from '@/utils/dom-utils';
 import { escapeHtml } from '@/utils/sanitize';
 import { BOARD_REGIONS, DEFAULT_REGION_ID, buildBoardHtml, buildRegimeHistoryBlock, buildWeeklyBriefBlock, isLatestSequence } from './regional-intelligence-board-utils';
+import { IntelligenceServiceClient } from '@/services/generated-rpc-clients';
 
 // get-regional-snapshot + get-regime-history + get-regional-brief are
 // premium-gated. Plain globalThis.fetch skips Clerk/tester/api-key injection
 // and returns 401 for pro users — premiumFetch is the correct fetcher here.
-const client = new IntelligenceServiceClient(getRpcBaseUrl(), { fetch: premiumFetch });
+const getIntelligenceClient = createLazyClient(() => new IntelligenceServiceClient(getRpcBaseUrl(), { fetch: premiumFetch }));
 
 /**
  * RegionalIntelligenceBoard — premium panel rendering a canonical
@@ -68,6 +70,7 @@ export class RegionalIntelligenceBoard extends Panel {
    * previous "Panel has no destroy hook" comment was wrong.
    */
   private authUnsubscribe: (() => void) | null = null;
+  private entitlementUnsubscribe: (() => void) | null = null;
 
   constructor() {
     super({
@@ -108,20 +111,8 @@ export class RegionalIntelligenceBoard extends Panel {
     // session hasn't resolved at panel-construction time would see
     // renderEmpty() and then stay empty forever even after sign-in, because
     // nothing else triggers loadCurrent for the current region.
-    this.authUnsubscribe = subscribeAuthState(() => {
-      const hasPremium = hasPremiumAccess();
-      if (hasPremium && !this.lastHadPremium) {
-        this.lastHadPremium = true;
-        void this.loadCurrent();
-      } else if (!hasPremium && this.lastHadPremium) {
-        // Entitlement was revoked (sign-out, subscription ended) — blank
-        // the panel so stale data doesn't linger for a user who can no
-        // longer see it. Panel locking separately re-applies via
-        // panel-layout's auth subscription.
-        this.lastHadPremium = false;
-        this.renderEmpty();
-      }
-    });
+    this.authUnsubscribe = subscribeAuthState(() => this.handlePremiumAccessChange());
+    this.entitlementUnsubscribe = onEntitlementChange(() => this.handlePremiumAccessChange());
   }
 
   /** Public API for tests and agent tools: force-load a region directly. */
@@ -134,6 +125,8 @@ export class RegionalIntelligenceBoard extends Panel {
   override destroy(): void {
     this.authUnsubscribe?.();
     this.authUnsubscribe = null;
+    this.entitlementUnsubscribe?.();
+    this.entitlementUnsubscribe = null;
     // Invalidate any in-flight loadCurrent: the existing sequence guard
     // (see `isLatestSequence` checks) drops responses whose sequence no
     // longer matches `latestSequence`. Bumping it here ensures a pending
@@ -143,7 +136,28 @@ export class RegionalIntelligenceBoard extends Panel {
     super.destroy();
   }
 
+  private handlePremiumAccessChange(): void {
+    const hasPremium = hasPremiumAccess();
+    if (hasPremium && !this.lastHadPremium) {
+      this.lastHadPremium = true;
+      void this.loadCurrent();
+    } else if (!hasPremium && this.lastHadPremium) {
+      // Entitlement was revoked (sign-out, subscription ended) — blank
+      // the panel so stale data doesn't linger for a user who can no
+      // longer see it. Panel locking separately re-applies via
+      // panel-layout's auth subscription.
+      this.lastHadPremium = false;
+      this.latestSequence += 1;
+      this.renderEmpty();
+    }
+  }
+
   private async loadCurrent(): Promise<void> {
+    if (!this.element.isConnected) {
+      this.runWhenConnected(() => { void this.loadCurrent(); });
+      return;
+    }
+
     // Skip premium RPCs when this app instance is running inside the /pro
     // marketing page's live-preview iframe — no Clerk session carries across
     // that boundary, so every call would 401. The breaker + renderEmpty path
@@ -178,14 +192,68 @@ export class RegionalIntelligenceBoard extends Panel {
     // board's core render path. PR #2995 review: the old Promise.allSettled
     // approach blocked the entire panel on slow enrichment RPCs.
     let snapshot: RegionalSnapshot | undefined;
+    let actualRegion = myRegion;
+    let fallbackFrom: string | null = null;
     try {
-      const resp = await client.getRegionalSnapshot({ regionId: myRegion });
+      const resp = await getIntelligenceClient().getRegionalSnapshot({ regionId: myRegion });
       if (!isLatestSequence(mySequence, this.latestSequence)) return;
       snapshot = resp.snapshot;
     } catch (err) {
       if (!isLatestSequence(mySequence, this.latestSequence)) return;
       this.renderError(err instanceof Error ? err.message : String(err));
       return;
+    }
+
+    // If the requested region has no snapshot yet, race the other regions
+    // and render the FIRST one that returns data. Better UX than telling
+    // the user to wait — and we never block on a slow/hung region because
+    // (a) we resolve on the first non-empty success rather than waiting for
+    // all to settle, and (b) a hard timeout caps the total wait. The
+    // generated client has no default per-request timeout, so without both
+    // guards a single hung region could leave the panel on the loader.
+    if (!snapshot?.regionId) {
+      const fallbackIds = BOARD_REGIONS.map(r => r.id).filter(id => id !== myRegion);
+      const FALLBACK_TIMEOUT_MS = 4000;
+      const winner = await new Promise<{ snapshot: RegionalSnapshot; id: string } | null>(resolve => {
+        if (fallbackIds.length === 0) {
+          resolve(null);
+          return;
+        }
+        let resolved = false;
+        let pending = fallbackIds.length;
+        const settle = (value: { snapshot: RegionalSnapshot; id: string } | null) => {
+          if (resolved) return;
+          resolved = true;
+          resolve(value);
+        };
+        const timer = setTimeout(() => settle(null), FALLBACK_TIMEOUT_MS);
+        for (const id of fallbackIds) {
+          getIntelligenceClient().getRegionalSnapshot({ regionId: id })
+            .then(resp => {
+              if (resp.snapshot?.regionId) {
+                clearTimeout(timer);
+                settle({ snapshot: resp.snapshot, id });
+                return;
+              }
+              if (--pending === 0) {
+                clearTimeout(timer);
+                settle(null);
+              }
+            })
+            .catch(() => {
+              if (--pending === 0) {
+                clearTimeout(timer);
+                settle(null);
+              }
+            });
+        }
+      });
+      if (!isLatestSequence(mySequence, this.latestSequence)) return;
+      if (winner) {
+        snapshot = winner.snapshot;
+        actualRegion = winner.id;
+        fallbackFrom = myRegion;
+      }
     }
 
     if (!snapshot?.regionId) {
@@ -199,13 +267,12 @@ export class RegionalIntelligenceBoard extends Panel {
     // the background enrichment RPCs resolve. Without null here, the default
     // undefined would render a false "No weekly brief available yet" while
     // the fetch is still in flight. PR #2995 review.
-    this.renderBoard(snapshot, null, null);
+    this.renderBoard(snapshot, null, null, fallbackFrom);
 
-    // Phase 2: fire history + brief RPCs in background. When they resolve,
-    // re-render with the enrichments appended — but only if this sequence
-    // is still current (user hasn't switched regions in the meantime).
-    const historyPromise = client.getRegimeHistory({ regionId: myRegion, limit: 20 }).catch(() => null);
-    const briefPromise = client.getRegionalBrief({ regionId: myRegion }).catch(() => null);
+    // Phase 2: fire history + brief RPCs in background. Use actualRegion so
+    // the enrichments match the rendered snapshot when we fell back.
+    const historyPromise = getIntelligenceClient().getRegimeHistory({ regionId: actualRegion, limit: 20 }).catch(() => null);
+    const briefPromise = getIntelligenceClient().getRegionalBrief({ regionId: actualRegion }).catch(() => null);
 
     Promise.allSettled([historyPromise, briefPromise]).then(([hResult, bResult]) => {
       if (!isLatestSequence(mySequence, this.latestSequence)) return;
@@ -226,28 +293,39 @@ export class RegionalIntelligenceBoard extends Panel {
           ? bValue.brief   // undefined = no brief yet, RegionalBrief = render
           : null;          // null = RPC or upstream failed → omit block
 
-      this.renderBoard(snapshot!, transitions, brief);
+      this.renderBoard(snapshot!, transitions, brief, fallbackFrom);
     });
   }
 
   private renderLoading(): void {
-    this.body.innerHTML =
-      '<div class="rib-status" style="padding:16px;color:var(--text-dim);font-size:12px">Loading regional snapshot…</div>';
+    setTrustedHtml(this.body, trustedHtml('<div class="rib-status" style="padding:16px;color:var(--text-dim);font-size:12px">Loading regional intelligence…</div>', "legacy direct innerHTML migration"));
   }
 
   private renderEmpty(): void {
-    this.body.innerHTML =
-      '<div class="rib-status" style="padding:16px;color:var(--text-dim);font-size:12px">No snapshot available yet for this region. The next cron cycle will populate it within 6 hours.</div>';
+    setTrustedHtml(this.body, trustedHtml('<div class="rib-status" style="padding:16px;color:var(--text-dim);font-size:12px">Regional intelligence is being refreshed. Try selecting another region above.</div>', "legacy direct innerHTML migration"));
   }
 
   private renderError(message: string): void {
-    this.body.innerHTML = `<div class="rib-status rib-status-error" style="padding:16px;color:var(--danger);font-size:12px">Failed to load snapshot: ${escapeHtml(message)}</div>`;
+    setTrustedHtml(this.body, trustedHtml(`<div class="rib-status rib-status-error" style="padding:16px;color:var(--danger);font-size:12px">We couldn't load this region right now: ${escapeHtml(message)}</div>`, "legacy direct innerHTML migration"));
   }
 
   /** Render the full board HTML from a hydrated snapshot + optional Phase 3 data.
-   *  null = RPC failed (omit block entirely), array/object = RPC succeeded (render, even if empty). */
-  public renderBoard(snapshot: RegionalSnapshot, transitions?: RegimeTransition[] | null, brief?: RegionalBrief | null): void {
-    let html = buildBoardHtml(snapshot);
+   *  null = RPC failed (omit block entirely), array/object = RPC succeeded (render, even if empty).
+   *  fallbackFrom: when set, renders a small notice explaining we're showing a
+   *  different region than the one the user selected. */
+  public renderBoard(
+    snapshot: RegionalSnapshot,
+    transitions?: RegimeTransition[] | null,
+    brief?: RegionalBrief | null,
+    fallbackFrom?: string | null,
+  ): void {
+    let html = '';
+    if (fallbackFrom) {
+      const requestedLabel = BOARD_REGIONS.find(r => r.id === fallbackFrom)?.label ?? fallbackFrom;
+      const actualLabel = BOARD_REGIONS.find(r => r.id === snapshot.regionId)?.label ?? snapshot.regionId;
+      html += `<div class="rib-fallback-notice" style="padding:10px 16px;margin:0 0 8px;background:var(--bg-elevated,rgba(255,255,255,0.04));border-left:3px solid var(--warning,#d4a015);font-size:12px;color:var(--text-dim);line-height:1.5">${escapeHtml(requestedLabel)} is being refreshed — showing ${escapeHtml(actualLabel)} in the meantime.</div>`;
+    }
+    html += buildBoardHtml(snapshot);
     // Phase 3 blocks: only render when the RPC succeeded (non-null).
     // null means the RPC failed — omit the block so we don't show a
     // misleading "no data yet" message for a transient outage.
@@ -261,6 +339,6 @@ export class RegionalIntelligenceBoard extends Panel {
     if (brief !== null) {
       html += buildWeeklyBriefBlock(brief);
     }
-    this.body.innerHTML = html;
+    setTrustedHtml(this.body, trustedHtml(html, "legacy direct innerHTML migration"));
   }
 }

@@ -1,9 +1,21 @@
-import '@/styles/settings-window.css';
-import { FEEDS, INTEL_SOURCES, SOURCE_REGION_MAP } from '@/config/feeds';
-import { PANEL_CATEGORY_MAP, ALL_PANELS, VARIANT_DEFAULTS, getEffectivePanelConfig, isPanelEntitled, FREE_MAX_PANELS } from '@/config/panels';
+import { CANONICAL_FEEDS, INTEL_SOURCES, SOURCE_REGION_MAP } from '@/config/feeds';
+import {
+  PANEL_CATEGORY_MAP,
+  ALL_PANELS,
+  VARIANT_DEFAULTS,
+  getEffectivePanelConfig,
+  getVariantPanelCategories,
+  isPanelEntitled,
+  FREE_MAX_PANELS,
+  countFreePanelCapUsage,
+  isFreePanelCapCounted,
+} from '@/config/panels';
 import { isProUser } from '@/services/widget-store';
 import { SITE_VARIANT } from '@/config/variant';
 import { t } from '@/services/i18n';
+import { createSettingsButton } from '@/components/settings-button';
+import { confirmDialog } from '@/components/confirm-dialog';
+import type { UnifiedSettingsTabId } from '@/components/settings-types';
 import type { MapProvider } from '@/config/basemap';
 import { escapeHtml } from '@/utils/sanitize';
 import type { PanelConfig } from '@/types';
@@ -15,6 +27,14 @@ import { isEntitled, hasFeature, onEntitlementChange, getEntitlementState } from
 import { hasPremiumAccess } from '@/services/panel-gating';
 import { getSubscription, openBillingPortal, prereserveBillingPortalTab } from '@/services/billing';
 import { createApiKey, listApiKeys, revokeApiKey, type ApiKeyInfo } from '@/services/api-keys';
+import { listMcpClients, revokeMcpClient, fetchMcpQuota, type McpClientInfo, type McpQuota } from '@/services/mcp-clients';
+import {
+  acknowledgePlanLimitNotice,
+  listCurrentPlanLimitNotices,
+  type ApiPlanLimitNotice,
+} from '@/services/api-plan-limit-notices';
+import { setTrustedHtml, trustedHtml } from '@/utils/dom-utils';
+
 
 function showToast(msg: string): void {
   document.querySelector('.toast-notification')?.remove();
@@ -25,8 +45,6 @@ function showToast(msg: string): void {
   requestAnimationFrame(() => el.classList.add('visible'));
   setTimeout(() => { el.classList.remove('visible'); setTimeout(() => el.remove(), 300); }, 4000);
 }
-
-const GEAR_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>`;
 
 export interface UnifiedSettingsConfig {
   getPanelSettings: () => Record<string, PanelConfig>;
@@ -41,7 +59,7 @@ export interface UnifiedSettingsConfig {
   onMapProviderChange?: (provider: MapProvider) => void;
 }
 
-type TabId = 'settings' | 'panels' | 'sources' | 'notifications' | 'api-keys';
+type TabId = UnifiedSettingsTabId;
 
 export class UnifiedSettings {
   private overlay: HTMLElement;
@@ -58,10 +76,20 @@ export class UnifiedSettings {
   private draftPanelSettings: Record<string, PanelConfig> = {};
   private panelsJustSaved = false;
   private savedTimeout: ReturnType<typeof setTimeout> | null = null;
+  private confirmingClose = false;
   private apiKeys: ApiKeyInfo[] = [];
   private apiKeysLoading = false;
   private apiKeysError = '';
   private newlyCreatedKey: string | null = null;
+  private planLimitNotices: ApiPlanLimitNotice[] = [];
+  private planLimitNoticesLoading = false;
+  // ---- Connected MCP clients tab (plan 2026-05-10-001 U9) ----
+  private mcpClients: McpClientInfo[] = [];
+  private mcpClientsLoading = false;
+  private mcpClientsError = '';
+  private mcpQuota: McpQuota | null = null;
+  /** setInterval handle for quota auto-refresh; cleared on close()/destroy()/tab-switch. */
+  private mcpQuotaTimer: ReturnType<typeof setInterval> | null = null;
   private unsubscribeEntitlement: (() => void) | null = null;
   // Bounded "entitlement snapshot might still arrive" window. Starts false
   // on open() when currentState is null, flips true on first snapshot OR
@@ -105,13 +133,52 @@ export class UnifiedSettings {
         return;
       }
 
+      if (target.closest('.upgrade-to-business-btn')) {
+        // Self-serve Starter→Business upgrade (#4634): open the Dodo customer
+        // portal, which surfaces the prorated plan change via the product
+        // collection ("Allow Subscription Updates" enabled). Same hosted open
+        // path as Manage Billing — Dodo owns payment + 3DS + proration; a failed
+        // charge (prevent_change) leaves the customer on Starter.
+        const reservedWin = prereserveBillingPortalTab();
+        void openBillingPortal(reservedWin).then((result) => {
+          if (result.outcome === 'no-customer') {
+            showToast(
+              'Subscription is managed outside Dodo. Email support@worldmonitor.app for help.',
+            );
+          }
+        });
+        return;
+      }
+
       if (target.closest('.manage-billing-btn')) {
         // Pre-reserve the portal tab synchronously inside the click
         // handler so the popup blocker doesn't suppress the eventual
         // window.open inside openBillingPortal (which runs after an
         // await of the Convex action).
         const reservedWin = prereserveBillingPortalTab();
-        void openBillingPortal(reservedWin);
+        void openBillingPortal(reservedWin).then((result) => {
+          // NO_CUSTOMER: user is entitled but has no Dodo customer row
+          // (comp grant, restore race, or post-purge cancellation). Send
+          // them somewhere actionable instead of leaving them in a
+          // generic Dodo portal that won't recognise them.
+          if (result.outcome === 'no-customer') {
+            showToast(
+              'Subscription is managed outside Dodo. Email support@worldmonitor.app for help.',
+            );
+          }
+        });
+        return;
+      }
+
+      const planNoticeAck = target.closest<HTMLElement>('[data-plan-limit-ack]');
+      if (planNoticeAck?.dataset.planLimitAck) {
+        void this.handleAcknowledgePlanLimitNotice(planNoticeAck.dataset.planLimitAck);
+        return;
+      }
+
+      const planNoticeCta = target.closest<HTMLElement>('[data-plan-limit-cta]');
+      if (planNoticeCta?.dataset.planLimitCta) {
+        this.handlePlanLimitNoticeCta(planNoticeCta.dataset.planLimitCta);
         return;
       }
 
@@ -145,7 +212,7 @@ export class UnifiedSettings {
       const panelItem = target.closest<HTMLElement>('.panel-toggle-item');
       if (panelItem?.dataset.panel) {
         if (panelItem.dataset.proLocked) {
-          window.open('/pro', '_blank');
+          window.open('/pro', '_blank', 'noopener,noreferrer');
           return;
         }
         this.toggleDraftPanel(panelItem.dataset.panel);
@@ -209,6 +276,33 @@ export class UnifiedSettings {
         }
         return;
       }
+
+      const mcpRevokeBtn = target.closest<HTMLElement>('.mcp-clients-revoke-btn');
+      if (mcpRevokeBtn?.dataset.tokenId) {
+        void this.handleRevokeMcpClient(mcpRevokeBtn.dataset.tokenId);
+        return;
+      }
+
+      const mcpCopyUrlBtn = target.closest<HTMLElement>('.mcp-clients-copy-url-btn');
+      if (mcpCopyUrlBtn?.dataset.copyValue) {
+        const value = mcpCopyUrlBtn.dataset.copyValue;
+        // navigator.clipboard is async + can reject (insecure context, perms);
+        // fall back gracefully so the button never silently no-ops.
+        const showCopied = () => {
+          mcpCopyUrlBtn.textContent = 'Copied!';
+          setTimeout(() => { mcpCopyUrlBtn.textContent = 'Copy URL'; }, 1500);
+        };
+        if (navigator.clipboard?.writeText) {
+          void navigator.clipboard.writeText(value).then(showCopied).catch(() => {
+            mcpCopyUrlBtn.textContent = 'Copy failed';
+            setTimeout(() => { mcpCopyUrlBtn.textContent = 'Copy URL'; }, 1500);
+          });
+        } else {
+          mcpCopyUrlBtn.textContent = 'Copy unavailable';
+          setTimeout(() => { mcpCopyUrlBtn.textContent = 'Copy URL'; }, 1500);
+        }
+        return;
+      }
     });
 
     this.overlay.addEventListener('input', (e) => {
@@ -248,7 +342,7 @@ export class UnifiedSettings {
       this.entitlementReady = true;
       const panel = this.overlay.querySelector<HTMLElement>('[data-panel-id="api-keys"]');
       if (panel) {
-        panel.innerHTML = this.renderApiKeysContent();
+        setTrustedHtml(panel, trustedHtml(this.renderApiKeysContent(), "legacy direct innerHTML migration"));
         // Re-attach CTA and input handlers for the refreshed content
         this.attachApiKeysHandlers();
         if (this.activeTab === 'api-keys' && getAuthState().user && hasFeature('apiAccess')) {
@@ -284,13 +378,28 @@ export class UnifiedSettings {
     const upgradeSection = this.overlay.querySelector('.upgrade-pro-section');
     if (!upgradeSection) return;
     const fresh = document.createElement('template');
-    fresh.innerHTML = this.renderUpgradeSection().trim();
+    setTrustedHtml(fresh, trustedHtml(this.renderUpgradeSection().trim(), "legacy direct innerHTML migration"));
     const next = fresh.content.firstElementChild;
     if (next) upgradeSection.replaceWith(next);
   }
 
   public close(): void {
-    if (this.hasPendingPanelChanges() && !confirm(t('header.unsavedChanges'))) return;
+    // Unsaved panel changes → confirm before tearing down. The confirm is a
+    // non-blocking in-app dialog (#4559): close() stays synchronous (8 callers)
+    // and defers teardown to the user's choice instead of a blocking confirm().
+    if (this.hasPendingPanelChanges()) {
+      if (this.confirmingClose) return; // a confirm is already on screen
+      this.confirmingClose = true;
+      void confirmDialog({ message: t('header.unsavedChanges') }).then((discard) => {
+        this.confirmingClose = false;
+        if (discard) this.teardownSettings();
+      });
+      return;
+    }
+    this.teardownSettings();
+  }
+
+  private teardownSettings(): void {
     this.overlay.classList.remove('active');
     this.prefsCleanup?.();
     this.prefsCleanup = null;
@@ -303,6 +412,7 @@ export class UnifiedSettings {
       clearTimeout(this.entitlementReadyTimer);
       this.entitlementReadyTimer = null;
     }
+    this.stopMcpQuotaPolling();
     this.resetPanelDraft();
     localStorage.removeItem('wm-settings-open');
     document.removeEventListener('keydown', this.escapeHandler);
@@ -314,13 +424,7 @@ export class UnifiedSettings {
   }
 
   public getButton(): HTMLButtonElement {
-    const btn = document.createElement('button');
-    btn.className = 'unified-settings-btn';
-    btn.id = 'unifiedSettingsBtn';
-    btn.setAttribute('aria-label', t('header.settings'));
-    btn.innerHTML = GEAR_SVG;
-    btn.addEventListener('click', () => this.open());
-    return btn;
+    return createSettingsButton(() => this.open());
   }
 
   public destroy(): void {
@@ -341,6 +445,7 @@ export class UnifiedSettings {
       clearTimeout(this.entitlementReadyTimer);
       this.entitlementReadyTimer = null;
     }
+    this.stopMcpQuotaPolling();
     document.removeEventListener('keydown', this.escapeHandler);
     this.overlay.remove();
   }
@@ -364,7 +469,7 @@ export class UnifiedSettings {
       ? renderNotificationsSettings({ isSignedIn })
       : null;
 
-    this.overlay.innerHTML = `
+    setTrustedHtml(this.overlay, trustedHtml(`
       <div class="modal unified-settings-modal">
         <div class="modal-header">
           <span class="modal-title">${t('header.settings')}</span>
@@ -376,6 +481,7 @@ export class UnifiedSettings {
           <button class="${tabClass('sources')}" data-tab="sources" role="tab" aria-selected="${this.activeTab === 'sources'}" id="us-tab-sources" aria-controls="us-tab-panel-sources">${t('header.tabSources')}</button>
           ${showNotificationsTab ? `<button class="${tabClass('notifications')}" data-tab="notifications" role="tab" aria-selected="${this.activeTab === 'notifications'}" id="us-tab-notifications" aria-controls="us-tab-panel-notifications">${t('header.tabNotifications')}</button>` : ''}
           <button class="${tabClass('api-keys')}" data-tab="api-keys" role="tab" aria-selected="${this.activeTab === 'api-keys'}" id="us-tab-api-keys" aria-controls="us-tab-panel-api-keys">API Keys <span class="panel-pro-badge">PRO</span></button>
+          ${hasFeature('mcpAccess') ? `<button class="${tabClass('mcp-clients')}" data-tab="mcp-clients" role="tab" aria-selected="${this.activeTab === 'mcp-clients'}" id="us-tab-mcp-clients" aria-controls="us-tab-panel-mcp-clients">MCP Clients <span class="panel-pro-badge">PRO</span></button>` : ''}
         </div>
         <div class="unified-settings-tab-panel${this.activeTab === 'settings' ? ' active' : ''}" data-panel-id="settings" id="us-tab-panel-settings" role="tabpanel" aria-labelledby="us-tab-settings">
           ${prefs.html}
@@ -417,8 +523,13 @@ export class UnifiedSettings {
         <div class="unified-settings-tab-panel${this.activeTab === 'api-keys' ? ' active' : ''}" data-panel-id="api-keys" id="us-tab-panel-api-keys" role="tabpanel" aria-labelledby="us-tab-api-keys">
           ${this.renderApiKeysContent()}
         </div>
+        ${hasFeature('mcpAccess') ? `
+        <div class="unified-settings-tab-panel${this.activeTab === 'mcp-clients' ? ' active' : ''}" data-panel-id="mcp-clients" id="us-tab-panel-mcp-clients" role="tabpanel" aria-labelledby="us-tab-mcp-clients">
+          ${this.renderMcpClientsContent()}
+        </div>
+        ` : ''}
       </div>
-    `;
+    `, "legacy direct innerHTML migration"));
 
     const settingsPanel = this.overlay.querySelector('#us-tab-panel-settings');
     if (settingsPanel) {
@@ -446,8 +557,15 @@ export class UnifiedSettings {
     this.updateSourcesCounter();
 
     this.attachApiKeysHandlers();
+    if (this.activeTab === 'api-keys' || this.activeTab === 'mcp-clients') {
+      void this.loadPlanLimitNotices();
+    }
     if (this.activeTab === 'api-keys' && getAuthState().user && hasFeature('apiAccess')) {
       void this.loadApiKeys();
+    }
+    if (this.activeTab === 'mcp-clients' && getAuthState().user && hasFeature('mcpAccess')) {
+      void this.loadMcpClients();
+      this.startMcpQuotaPolling();
     }
   }
 
@@ -465,7 +583,18 @@ export class UnifiedSettings {
     });
 
     if (tab === 'api-keys' && getAuthState().user && hasFeature('apiAccess')) {
+      void this.loadPlanLimitNotices();
       void this.loadApiKeys();
+    }
+
+    if (tab === 'mcp-clients' && getAuthState().user && hasFeature('mcpAccess')) {
+      void this.loadPlanLimitNotices();
+      void this.loadMcpClients();
+      this.startMcpQuotaPolling();
+    } else {
+      // Stop polling when switching away — no need to keep the timer running
+      // for a hidden tab.
+      this.stopMcpQuotaPolling();
     }
 
     if (tab === 'notifications') {
@@ -538,6 +667,7 @@ export class UnifiedSettings {
             <span style="color:${statusColor};font-weight:600;font-size:13px;">${escapeHtml(planName)}</span>
           </div>
           ${statusLine ? `<div class="upgrade-pro-status-line">${escapeHtml(statusLine)}</div>` : ''}
+          ${sub?.planKey === 'api_starter' ? `<button class="upgrade-to-business-btn" style="margin-right:8px;">Upgrade to Business</button>` : ''}
           <button class="manage-billing-btn">Manage Billing</button>
         </div>
       `;
@@ -585,33 +715,35 @@ export class UnifiedSettings {
     if (isEntitled()) {
       this.close();
       const reservedWin = prereserveBillingPortalTab();
-      void openBillingPortal(reservedWin);
+      void openBillingPortal(reservedWin).then((result) => {
+        if (result.outcome === 'no-customer') {
+          showToast(
+            'Subscription is managed outside Dodo. Email support@worldmonitor.app for help.',
+          );
+        }
+      });
       return;
     }
     this.close();
     if (this.config.isDesktopApp) {
-      window.open('https://worldmonitor.app/pro', '_blank');
+      window.open('https://worldmonitor.app/pro', '_blank', 'noopener,noreferrer');
       return;
     }
     import('@/services/checkout').then(m => import('@/config/products').then(p => m.startCheckout(p.DEFAULT_UPGRADE_PRODUCT))).catch(() => {
-      window.open('https://worldmonitor.app/pro', '_blank');
+      window.open('https://worldmonitor.app/pro', '_blank', 'noopener,noreferrer');
     });
   }
 
+  private categoryMatchesVariant(catDef: { variants?: string[] }): boolean {
+    return !catDef.variants || catDef.variants.includes(SITE_VARIANT);
+  }
+
   private getAvailablePanelCategories(): Array<{ key: string; label: string }> {
-    const settings = this.config.getPanelSettings();
-    const categories: Array<{ key: string; label: string }> = [
-      { key: 'all', label: t('header.sourceRegionAll') }
+    return [
+      { key: 'all', label: t('header.sourceRegionAll') },
+      ...getVariantPanelCategories(this.config.getPanelSettings(), SITE_VARIANT)
+        .map(({ key, labelKey }) => ({ key, label: t(labelKey) })),
     ];
-
-    for (const [catKey, catDef] of Object.entries(PANEL_CATEGORY_MAP)) {
-      const hasEnabledPanel = catDef.panelKeys.some(pk => settings[pk]?.enabled);
-      if (hasEnabledPanel) {
-        categories.push({ key: catKey, label: t(catDef.labelKey) });
-      }
-    }
-
-    return categories;
   }
 
   private getVisiblePanelEntries(): Array<[string, PanelConfig]> {
@@ -623,6 +755,9 @@ export class UnifiedSettings {
     if (this.activePanelCategory !== 'all') {
       const catDef = PANEL_CATEGORY_MAP[this.activePanelCategory];
       if (catDef) {
+        if (!this.categoryMatchesVariant(catDef)) {
+          return [];
+        }
         const allowed = new Set(catDef.panelKeys);
         entries = entries.filter(([key]) => allowed.has(key));
       }
@@ -645,9 +780,9 @@ export class UnifiedSettings {
     if (!bar) return;
 
     const categories = this.getAvailablePanelCategories();
-    bar.innerHTML = categories.map(c =>
+    setTrustedHtml(bar, trustedHtml(categories.map(c =>
       `<button class="unified-settings-region-pill${this.activePanelCategory === c.key ? ' active' : ''}" data-panel-cat="${c.key}">${escapeHtml(c.label)}</button>`
-    ).join('');
+    ).join(''), "legacy direct innerHTML migration"));
   }
 
   private renderPanelsTab(): void {
@@ -657,19 +792,22 @@ export class UnifiedSettings {
     const savedSettings = this.config.getPanelSettings();
     const pro = isProUser();
     const entries = this.getVisiblePanelEntries();
-    container.innerHTML = entries.map(([key, panel]) => {
-      const entitled = isPanelEntitled(key, ALL_PANELS[key] ?? panel, pro);
+    setTrustedHtml(container, trustedHtml(entries.map(([key, panel]) => {
+      // Preserve saved config for dynamic cw-* panels; unknown keys should not
+      // collapse to getEffectivePanelConfig's disabled synthetic fallback.
+      const resolvedPanel = ALL_PANELS[key] ? getEffectivePanelConfig(key, SITE_VARIANT) : panel;
+      const entitled = isPanelEntitled(key, resolvedPanel, pro);
       const locked = !entitled;
       const changed = !locked && savedSettings[key]?.enabled !== panel.enabled;
-      const displayName = this.config.getLocalizedPanelName(key, getEffectivePanelConfig(key, SITE_VARIANT).name ?? panel.name);
+      const displayName = this.config.getLocalizedPanelName(key, resolvedPanel.name ?? panel.name);
       return `
         <div class="panel-toggle-item ${panel.enabled && !locked ? 'active' : ''}${changed ? ' changed' : ''}${locked ? ' pro-locked' : ''}" data-panel="${escapeHtml(key)}" aria-pressed="${panel.enabled && !locked}" ${locked ? 'data-pro-locked="1"' : ''}>
           <div class="panel-toggle-checkbox">${panel.enabled && !locked ? '\u2713' : ''}${locked ? '\uD83D\uDD12' : ''}</div>
           <span class="panel-toggle-label">${escapeHtml(displayName)}</span>
-          ${(locked || (ALL_PANELS[key] ?? panel).premium) ? '<span class="panel-toggle-pro-badge">PRO</span>' : ''}
+          ${(locked || resolvedPanel.premium) ? '<span class="panel-toggle-pro-badge">PRO</span>' : ''}
         </div>
       `;
-    }).join('');
+    }).join(''), "legacy direct innerHTML migration"));
 
     this.updatePanelsFooter();
   }
@@ -700,9 +838,12 @@ export class UnifiedSettings {
   private toggleDraftPanel(key: string): void {
     const panel = this.draftPanelSettings[key];
     if (!panel) return;
-    if (!panel.enabled && !isPanelEntitled(key, ALL_PANELS[key] ?? panel, isProUser())) return;
-    if (!panel.enabled && !isProUser()) {
-      const enabledCount = Object.entries(this.draftPanelSettings).filter(([k, p]) => p.enabled && !k.startsWith('cw-')).length;
+    // Preserve saved config for dynamic cw-* panels; unknown keys should not
+    // collapse to getEffectivePanelConfig's disabled synthetic fallback.
+    const resolvedPanel = ALL_PANELS[key] ? getEffectivePanelConfig(key, SITE_VARIANT) : panel;
+    if (!panel.enabled && !isPanelEntitled(key, resolvedPanel, isProUser())) return;
+    if (!panel.enabled && !isProUser() && isFreePanelCapCounted(key)) {
+      const enabledCount = countFreePanelCapUsage(this.draftPanelSettings);
       if (enabledCount >= FREE_MAX_PANELS) {
         showToast(t('modals.settingsWindow.freePanelLimit', { max: String(FREE_MAX_PANELS) }));
         return;
@@ -743,7 +884,10 @@ export class UnifiedSettings {
   }
 
   private getAvailableRegions(): Array<{ key: string; label: string }> {
-    const feedKeys = new Set(Object.keys(FEEDS));
+    // A region pill shows when at least one of its sources is actually being
+    // loaded — getAllSourceNames() covers the active preset PLUS any cross-
+    // variant panels the user enabled, so customized-in regions appear too.
+    const allowed = new Set(this.config.getAllSourceNames());
     const regions: Array<{ key: string; label: string }> = [
       { key: 'all', label: t('header.sourceRegionAll') }
     ];
@@ -755,7 +899,8 @@ export class UnifiedSettings {
         }
         continue;
       }
-      const hasFeeds = regionDef.feedKeys.some(fk => feedKeys.has(fk));
+      const hasFeeds = regionDef.feedKeys.some(fk =>
+        (CANONICAL_FEEDS[fk] ?? []).some(f => allowed.has(f.name)));
       if (hasFeeds) {
         regions.push({ key: regionKey, label: t(regionDef.labelKey) });
       }
@@ -766,7 +911,12 @@ export class UnifiedSettings {
 
   private getSourcesByRegion(): Map<string, string[]> {
     const map = new Map<string, string[]>();
-    const feedKeys = new Set(Object.keys(FEEDS));
+    // Resolve region membership from CANONICAL_FEEDS (the all-variant union),
+    // then intersect with the sources actually loaded — getAllSourceNames()
+    // already covers the active preset + any custom panels the user enabled —
+    // so a customized-in panel's sources show under their proper region pill,
+    // not just the 'all' view.
+    const allowed = new Set(this.config.getAllSourceNames());
 
     for (const [regionKey, regionDef] of Object.entries(SOURCE_REGION_MAP)) {
       const sources: string[] = [];
@@ -774,8 +924,8 @@ export class UnifiedSettings {
         INTEL_SOURCES.forEach(f => sources.push(f.name));
       } else {
         for (const fk of regionDef.feedKeys) {
-          if (feedKeys.has(fk)) {
-            FEEDS[fk]!.forEach(f => sources.push(f.name));
+          for (const f of CANONICAL_FEEDS[fk] ?? []) {
+            if (allowed.has(f.name)) sources.push(f.name);
           }
         }
       }
@@ -809,9 +959,9 @@ export class UnifiedSettings {
     if (!bar) return;
 
     const regions = this.getAvailableRegions();
-    bar.innerHTML = regions.map(r =>
+    setTrustedHtml(bar, trustedHtml(regions.map(r =>
       `<button class="unified-settings-region-pill${this.activeSourceRegion === r.key ? ' active' : ''}" data-region="${r.key}">${escapeHtml(r.label)}</button>`
-    ).join('');
+    ).join(''), "legacy direct innerHTML migration"));
   }
 
   private renderSourcesGrid(): void {
@@ -821,7 +971,7 @@ export class UnifiedSettings {
     const sources = this.getVisibleSourceNames();
     const disabled = this.config.getDisabledSources();
 
-    container.innerHTML = sources.map(source => {
+    setTrustedHtml(container, trustedHtml(sources.map(source => {
       const isEnabled = !disabled.has(source);
       const escaped = escapeHtml(source);
       return `
@@ -830,7 +980,7 @@ export class UnifiedSettings {
           <span class="source-toggle-label">${escaped}</span>
         </div>
       `;
-    }).join('');
+    }).join(''), "legacy direct innerHTML migration"));
   }
 
   private updateSourcesCounter(): void {
@@ -842,6 +992,134 @@ export class UnifiedSettings {
     const enabledTotal = allSources.length - disabled.size;
 
     counter.textContent = t('header.sourcesEnabled', { enabled: String(enabledTotal), total: String(allSources.length) });
+  }
+
+  private async loadPlanLimitNotices(): Promise<void> {
+    if (!getAuthState().user || this.planLimitNoticesLoading) return;
+    this.planLimitNoticesLoading = true;
+    try {
+      this.planLimitNotices = await listCurrentPlanLimitNotices();
+    } catch (err) {
+      console.warn('[settings] Failed to load API plan-limit notices:', err);
+      this.planLimitNotices = [];
+    } finally {
+      this.planLimitNoticesLoading = false;
+      this.renderPlanLimitNoticeBlocks();
+    }
+  }
+
+  private renderPlanLimitNoticeBlocks(): void {
+    const html = this.renderPlanLimitNotices();
+    this.overlay.querySelectorAll<HTMLElement>('[data-plan-limit-notices]').forEach((el) => {
+      setTrustedHtml(el, trustedHtml(html, "legacy direct innerHTML migration"));
+    });
+  }
+
+  private planLimitDimensionLabel(dimension: ApiPlanLimitNotice['dimension']): string {
+    switch (dimension) {
+      case 'api_daily_requests': return 'Daily API requests';
+      case 'api_minute_burst': return 'API burst traffic';
+      case 'mcp_daily_calls': return 'Daily MCP calls';
+      case 'mcp_minute_burst': return 'MCP burst traffic';
+    }
+  }
+
+  private planLimitStateLabel(state: ApiPlanLimitNotice['state']): string {
+    if (state === 'warning') return 'Nearing plan limit';
+    if (state === 'sustained_burst') return 'Burst limit exceeded';
+    return 'Plan limit exceeded';
+  }
+
+  private renderPlanLimitNotices(): string {
+    if (this.planLimitNotices.length === 0) return '';
+    const nf = new Intl.NumberFormat();
+    return `
+      <div class="api-plan-limit-notices" aria-live="polite">
+        ${this.planLimitNotices.map((notice) => {
+          const limit = notice.limit == null ? 'unlimited' : nf.format(notice.limit);
+          const usage = nf.format(notice.usage);
+          const ratio = notice.usageRatio == null ? '' : ` (${Math.round(notice.usageRatio * 100)}%)`;
+          const cta = notice.ctaKind === 'contact_support'
+            ? 'Contact support'
+            : notice.ctaKind === 'billing_portal'
+            ? 'Manage billing'
+            : notice.ctaKind === 'checkout'
+            ? 'Upgrade'
+            : '';
+          return `
+            <div class="api-plan-limit-notice ${escapeHtml(notice.state)}">
+              <div class="api-plan-limit-notice-main">
+                <div class="api-plan-limit-notice-title">${escapeHtml(this.planLimitStateLabel(notice.state))}</div>
+                <div class="api-plan-limit-notice-body">
+                  ${escapeHtml(this.planLimitDimensionLabel(notice.dimension))}: ${escapeHtml(usage)} used / ${escapeHtml(limit)} included${escapeHtml(ratio)} in ${escapeHtml(notice.windowKey)}.
+                  You can upgrade for more room or reduce traffic to stay on this plan.
+                </div>
+              </div>
+              <div class="api-plan-limit-notice-actions">
+                ${cta ? `<button class="btn btn-primary api-plan-limit-notice-cta" data-plan-limit-cta="${escapeHtml(notice._id)}">${escapeHtml(cta)}</button>` : ''}
+                <button class="btn btn-ghost api-plan-limit-notice-ack" data-plan-limit-ack="${escapeHtml(notice._id)}">Dismiss</button>
+              </div>
+            </div>
+          `;
+        }).join('')}
+      </div>
+    `;
+  }
+
+  private async handleAcknowledgePlanLimitNotice(noticeId: string): Promise<void> {
+    try {
+      await acknowledgePlanLimitNotice(noticeId);
+      this.planLimitNotices = this.planLimitNotices.filter((notice) => notice._id !== noticeId);
+      this.renderPlanLimitNoticeBlocks();
+    } catch (err) {
+      console.warn('[settings] Failed to acknowledge API plan-limit notice:', err);
+      showToast('Could not dismiss this notice. Try again.');
+    }
+  }
+
+  private handlePlanLimitNoticeCta(noticeId: string): void {
+    const notice = this.planLimitNotices.find((item) => item._id === noticeId);
+    if (!notice) return;
+    if (notice.ctaKind === 'billing_portal') {
+      const reservedWin = prereserveBillingPortalTab();
+      void openBillingPortal(reservedWin).then((result) => {
+        if (result.outcome === 'no-customer') {
+          showToast('Subscription is managed outside Dodo. Email support@worldmonitor.app for help.');
+        }
+      });
+      return;
+    }
+    if (notice.ctaKind === 'checkout') {
+      // Never send an active subscriber to a fresh checkout. The upgrade target
+      // (api_starter) sits in a DIFFERENT tierGroup than an existing Pro sub, and
+      // getCheckoutBlockingSubscription only blocks a same-tierGroup duplicate
+      // (#4797) — so startCheckout would STACK a second live subscription and
+      // double-charge. Route entitled users to the billing portal instead (same
+      // precedent as handleUpgradeClick); its no-customer outcome surfaces the
+      // support path for a subscription managed outside Dodo.
+      if (isEntitled()) {
+        const reservedWin = prereserveBillingPortalTab();
+        void openBillingPortal(reservedWin).then((result) => {
+          if (result.outcome === 'no-customer') {
+            showToast('Subscription is managed outside Dodo. Email support@worldmonitor.app for help.');
+          }
+        });
+        return;
+      }
+      this.close();
+      import('@/services/checkout').then(m => import('@/config/products').then((p) => {
+        const product = notice.upgradeTargetPlanKey === 'api_starter'
+          ? p.DODO_PRODUCTS.API_STARTER_MONTHLY
+          : p.DODO_PRODUCTS.PRO_MONTHLY;
+        return m.startCheckout(product);
+      })).catch(() => {
+        window.open('https://worldmonitor.app/pro', '_blank', 'noopener,noreferrer');
+      });
+      return;
+    }
+    if (notice.ctaKind === 'contact_support') {
+      window.location.href = `mailto:support@worldmonitor.app?subject=${encodeURIComponent('WorldMonitor API plan limit upgrade')}`;
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -867,7 +1145,7 @@ export class UnifiedSettings {
         } else {
           this.close();
           import('@/services/checkout').then(m => import('@/config/products').then(p => m.startCheckout(p.DODO_PRODUCTS.API_STARTER_MONTHLY))).catch(() => {
-            window.open('https://worldmonitor.app/pro', '_blank');
+            window.open('https://worldmonitor.app/pro', '_blank', 'noopener,noreferrer');
           });
         }
       });
@@ -899,6 +1177,7 @@ export class UnifiedSettings {
 
     return `
       <div class="api-keys-section">
+        <div data-plan-limit-notices>${this.renderPlanLimitNotices()}</div>
         <div class="api-keys-header">
           <p class="api-keys-desc">Create API keys to access WorldMonitor data programmatically. Keys are shown once on creation — store them securely.</p>
         </div>
@@ -980,20 +1259,20 @@ export class UnifiedSettings {
     if (!banner) return;
 
     banner.style.display = 'block';
-    banner.innerHTML = `
+    setTrustedHtml(banner, trustedHtml(`
       <div class="api-keys-banner-title">Key created — copy it now, it won't be shown again</div>
       <div class="api-keys-banner-key">
         <code class="api-keys-key-value">${escapeHtml(key)}</code>
         <button class="btn btn-secondary api-keys-copy-btn">Copy</button>
       </div>
-    `;
+    `, "legacy direct innerHTML migration"));
   }
 
   private hideBanner(): void {
     const banner = this.overlay.querySelector<HTMLElement>('#usApiKeysBanner');
     if (banner) {
       banner.style.display = 'none';
-      banner.innerHTML = '';
+      setTrustedHtml(banner, trustedHtml('', "legacy direct innerHTML migration"));
     }
   }
 
@@ -1014,7 +1293,7 @@ export class UnifiedSettings {
     if (!container) return;
 
     if (this.apiKeysLoading && this.apiKeys.length === 0) {
-      container.innerHTML = '<div class="api-keys-loading">Loading...</div>';
+      setTrustedHtml(container, trustedHtml('<div class="api-keys-loading">Loading...</div>', "legacy direct innerHTML migration"));
       return;
     }
 
@@ -1024,7 +1303,7 @@ export class UnifiedSettings {
     const revoked = this.apiKeys.filter(k => k.revokedAt);
 
     if (active.length === 0 && revoked.length === 0) {
-      container.innerHTML = '<div class="api-keys-empty">No API keys yet. Create one above to get started.</div>';
+      setTrustedHtml(container, trustedHtml('<div class="api-keys-empty">No API keys yet. Create one above to get started.</div>', "legacy direct innerHTML migration"));
       return;
     }
 
@@ -1048,7 +1327,226 @@ export class UnifiedSettings {
       `;
     };
 
-    container.innerHTML = active.map(renderKey).join('')
-      + (revoked.length > 0 ? `<div class="api-keys-revoked-section"><div class="api-keys-revoked-label">Revoked</div>${revoked.map(renderKey).join('')}</div>` : '');
+    setTrustedHtml(container, trustedHtml(active.map(renderKey).join('')
+      + (revoked.length > 0 ? `<div class="api-keys-revoked-section"><div class="api-keys-revoked-label">Revoked</div>${revoked.map(renderKey).join('')}</div>` : ''), "legacy direct innerHTML migration"));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Connected MCP clients tab (plan 2026-05-10-001 U9)
+  //
+  // Distinct from the API Keys tab above (gated on `apiAccess`). This tab is
+  // gated on `mcpAccess` so Pro users (where `apiAccess === false`) see ONLY
+  // this tab. API Starter+ users (`apiAccess && mcpAccess`) see BOTH tabs;
+  // they manage independent surfaces (manual API keys vs auto-issued OAuth
+  // tokens for Claude Desktop / Cursor / etc).
+  // ---------------------------------------------------------------------------
+
+  private renderMcpClientsContent(): string {
+    const authState = getAuthState();
+
+    if (!authState.user) {
+      const lockIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>`;
+      return `
+        <div class="panel-locked-state">
+          <div class="panel-locked-icon">${lockIcon}</div>
+          <div class="panel-locked-desc">Sign in to manage connected MCP clients</div>
+        </div>`;
+    }
+
+    if (!hasFeature('mcpAccess')) {
+      // Defensive — if the user lost mcpAccess (subscription lapsed) but the
+      // tab was still rendered, show an upgrade CTA. Normal flow hides the
+      // tab entirely.
+      const upgradeIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="16 12 12 8 8 12"/><line x1="12" y1="16" x2="12" y2="8"/></svg>`;
+      return `
+        <div class="panel-locked-state">
+          <div class="panel-locked-icon">${upgradeIcon}</div>
+          <div class="panel-locked-desc">Connect Claude Desktop and other AI clients to your WorldMonitor account.</div>
+        </div>`;
+    }
+
+    return `
+      <div class="mcp-clients-section">
+        <div data-plan-limit-notices>${this.renderPlanLimitNotices()}</div>
+        <div class="mcp-clients-header">
+          <p class="mcp-clients-desc">Connect Claude Desktop, Cursor, and other AI clients to your WorldMonitor account. Each client gets its own credential — revoke any time.</p>
+        </div>
+        <div class="mcp-clients-quota" id="usMcpQuota" aria-live="polite">${this.renderMcpQuotaText()}</div>
+        <div class="mcp-clients-error" id="usMcpClientsError" style="display:none;"></div>
+        <div class="mcp-clients-list" id="usMcpClientsList">
+          <div class="mcp-clients-loading">Loading...</div>
+        </div>
+      </div>`;
+  }
+
+  private renderMcpQuotaText(): string {
+    const q = this.mcpQuota;
+    if (!q) {
+      return `<span class="mcp-clients-quota-loading">Loading quota...</span>`;
+    }
+    const reset = this.formatQuotaReset(q.resetsAt);
+    return `<span class="mcp-clients-quota-label">MCP daily quota:</span>
+      <strong>${q.used} / ${q.limit}</strong>
+      <span class="mcp-clients-quota-reset">used today, resets ${escapeHtml(reset)}</span>`;
+  }
+
+  private formatQuotaReset(iso: string): string {
+    const ts = Date.parse(iso);
+    if (!Number.isFinite(ts)) return 'at next UTC midnight';
+    const ms = ts - Date.now();
+    if (ms <= 0) return 'momentarily';
+    const totalSec = Math.floor(ms / 1000);
+    const hrs = Math.floor(totalSec / 3600);
+    const mins = Math.floor((totalSec % 3600) / 60);
+    if (hrs > 0) return `in ${hrs}h ${mins}m`;
+    if (mins > 0) return `in ${mins}m`;
+    return 'in under a minute';
+  }
+
+  private async loadMcpClients(): Promise<void> {
+    this.mcpClientsLoading = true;
+    this.mcpClientsError = '';
+    this.renderMcpClientsList();
+
+    try {
+      this.mcpClients = await listMcpClients();
+    } catch (err) {
+      this.mcpClientsError = err instanceof Error ? err.message : 'Failed to load MCP clients';
+    } finally {
+      this.mcpClientsLoading = false;
+      this.renderMcpClientsList();
+    }
+
+    // Kick a fresh quota fetch alongside the list so the user sees current
+    // numbers immediately on tab open (the polling timer takes 30s otherwise).
+    void this.refreshMcpQuota();
+  }
+
+  private async refreshMcpQuota(): Promise<void> {
+    try {
+      this.mcpQuota = await fetchMcpQuota();
+    } catch {
+      // fetchMcpQuota already returns sane fallbacks, but defensive catch.
+      this.mcpQuota = null;
+    }
+    this.renderMcpQuotaInPlace();
+  }
+
+  private renderMcpQuotaInPlace(): void {
+    const el = this.overlay.querySelector<HTMLElement>('#usMcpQuota');
+    if (el) setTrustedHtml(el, trustedHtml(this.renderMcpQuotaText(), "legacy direct innerHTML migration"));
+  }
+
+  /**
+   * Auto-refresh the quota counter every 30s while the tab is visible.
+   * Cleared on tab-switch, close(), and destroy() — see stopMcpQuotaPolling.
+   */
+  private startMcpQuotaPolling(): void {
+    if (this.mcpQuotaTimer) return; // idempotent
+    this.mcpQuotaTimer = setInterval(() => {
+      // Skip silently if the tab is no longer visible — can happen if the
+      // overlay was hidden via display:none rather than full destroy().
+      if (this.activeTab !== 'mcp-clients') return;
+      void this.refreshMcpQuota();
+    }, 30_000);
+  }
+
+  private stopMcpQuotaPolling(): void {
+    if (this.mcpQuotaTimer) {
+      clearInterval(this.mcpQuotaTimer);
+      this.mcpQuotaTimer = null;
+    }
+  }
+
+  private async handleRevokeMcpClient(tokenId: string): Promise<void> {
+    const client = this.mcpClients.find(c => c.id === tokenId);
+    const label = client?.name?.trim() ? `"${client.name}"` : 'this client';
+    if (!confirm(`Revoke ${label}? The connected AI client will need to re-authorize before its next request.`)) return;
+
+    try {
+      await revokeMcpClient(tokenId);
+      // Refresh both list (Convex query result cached locally) and quota
+      // (revoke does not change the daily counter, but the user might have
+      // crossed the boundary while the modal was open).
+      await this.loadMcpClients();
+    } catch (err) {
+      this.mcpClientsError = err instanceof Error ? err.message : 'Failed to revoke MCP client';
+      this.renderMcpClientsError();
+    }
+  }
+
+  private renderMcpClientsError(): void {
+    const el = this.overlay.querySelector<HTMLElement>('#usMcpClientsError');
+    if (!el) return;
+    if (this.mcpClientsError) {
+      el.style.display = 'block';
+      el.textContent = this.mcpClientsError;
+    } else {
+      el.style.display = 'none';
+      el.textContent = '';
+    }
+  }
+
+  private renderMcpClientsList(): void {
+    const container = this.overlay.querySelector('#usMcpClientsList');
+    if (!container) return;
+
+    if (this.mcpClientsLoading && this.mcpClients.length === 0) {
+      setTrustedHtml(container, trustedHtml('<div class="mcp-clients-loading">Loading...</div>', "legacy direct innerHTML migration"));
+      return;
+    }
+
+    this.renderMcpClientsError();
+
+    const active = this.mcpClients.filter(c => !c.revokedAt);
+    const revoked = this.mcpClients.filter(c => c.revokedAt);
+
+    if (active.length === 0 && revoked.length === 0) {
+      const mcpUrl = 'https://api.worldmonitor.app/mcp';
+      setTrustedHtml(container, trustedHtml(`
+        <div class="mcp-clients-empty">
+          <div class="mcp-clients-empty-title">No connected MCP clients yet</div>
+          <div class="mcp-clients-empty-desc">To connect Claude Desktop or another AI client, paste this URL into the client's MCP server settings and sign in with your WorldMonitor Pro account:</div>
+          <div class="mcp-clients-empty-url">
+            <code>${escapeHtml(mcpUrl)}</code>
+            <button class="btn btn-secondary mcp-clients-copy-url-btn" data-copy-value="${escapeHtml(mcpUrl)}">Copy URL</button>
+          </div>
+        </div>`, "legacy direct innerHTML migration"));
+      return;
+    }
+
+    const formatDate = (ts: number) => new Date(ts).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+    const formatRelative = (ts: number): string => {
+      const ms = Date.now() - ts;
+      const sec = Math.floor(ms / 1000);
+      if (sec < 60) return 'just now';
+      const min = Math.floor(sec / 60);
+      if (min < 60) return `${min}m ago`;
+      const hrs = Math.floor(min / 60);
+      if (hrs < 24) return `${hrs}h ago`;
+      return formatDate(ts);
+    };
+
+    const renderClient = (c: McpClientInfo) => {
+      const isRevoked = !!c.revokedAt;
+      const name = c.name?.trim() || 'Connected MCP client';
+      const lastUsed = c.lastUsedAt ? formatRelative(c.lastUsedAt) : 'never';
+      return `
+        <div class="mcp-clients-item${isRevoked ? ' revoked' : ''}">
+          <div class="mcp-clients-item-main">
+            <span class="mcp-clients-item-name">${escapeHtml(name)}</span>
+          </div>
+          <div class="mcp-clients-item-meta">
+            <span>Connected ${formatDate(c.createdAt)}</span>
+            <span>Last used ${escapeHtml(lastUsed)}</span>
+            ${isRevoked ? `<span class="mcp-clients-item-revoked-badge">Revoked ${formatDate(c.revokedAt!)}</span>` : ''}
+          </div>
+          ${!isRevoked ? `<button class="btn btn-ghost mcp-clients-revoke-btn" data-token-id="${escapeHtml(c.id)}">Revoke</button>` : ''}
+        </div>
+      `;
+    };
+
+    setTrustedHtml(container, trustedHtml(active.map(renderClient).join('')
+      + (revoked.length > 0 ? `<div class="mcp-clients-revoked-section"><div class="mcp-clients-revoked-label">Revoked</div>${revoked.map(renderClient).join('')}</div>` : ''), "legacy direct innerHTML migration"));
   }
 }

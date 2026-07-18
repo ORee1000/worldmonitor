@@ -9,7 +9,7 @@
  *            recipient's perspective; no distinguishing signal)
  *   -> 503 when Upstash is unreachable
  *
- * Unlike /api/brief/{userId}/{issueDate} which is HMAC-token-gated
+ * Unlike /api/brief/{userId}/{issueSlot} which is HMAC-token-gated
  * and personalised, this route is unauth'd. The hash in the URL is
  * the credential — anyone holding a valid hash reads the public
  * mirror until the pointer expires (7 days).
@@ -24,6 +24,8 @@ export const config = { runtime: 'edge' };
 import { getCorsHeaders, isDisallowedOrigin } from '../../_cors.js';
 // @ts-expect-error — JS module, no declaration file
 import { readRawJsonFromUpstash } from '../../_upstash-json.js';
+// @ts-expect-error — JS module, no declaration file
+import { captureSilentError } from '../../_sentry-edge.js';
 import { renderBriefMagazine } from '../../../server/_shared/brief-render.js';
 import {
   BRIEF_PUBLIC_POINTER_PREFIX,
@@ -91,7 +93,10 @@ const UNAVAILABLE_PAGE = renderErrorPage(
   'The brief service is having trouble right now. Please try again shortly.',
 );
 
-export default async function handler(req: Request): Promise<Response> {
+export default async function handler(
+  req: Request,
+  ctx?: { waitUntil: (p: Promise<unknown>) => void },
+): Promise<Response> {
   if (isDisallowedOrigin(req)) {
     return new Response('Origin not allowed', { status: 403 });
   }
@@ -130,20 +135,21 @@ export default async function handler(req: Request): Promise<Response> {
     ? refCodeRaw
     : undefined;
 
-  // Step 1: resolve pointer → {userId, issueDate}.
+  // Step 1: resolve pointer → {userId, issueSlot}.
   const pointerKey = `${BRIEF_PUBLIC_POINTER_PREFIX}${rawHash}`;
   let pointerRaw: unknown;
   try {
     pointerRaw = await readRawJsonFromUpstash(pointerKey);
   } catch (err) {
     console.error('[api/brief/public] pointer read failed:', (err as Error).message);
+    captureSilentError(err, { tags: { route: 'api/brief/public', step: 'pointer-read' }, ctx });
     return htmlResponse(req, 503, UNAVAILABLE_PAGE);
   }
   // The pointer is JSON-encoded at write time (both
   // api/brief/share-url.ts and api/brief/[userId]/[issueDate].ts
   // JSON.stringify the encoded string before SET). readRawJsonFromUpstash
   // parses it back to a bare JS string, which decodePublicPointer
-  // handles directly. We also accept an object form ({userId, issueDate})
+  // handles directly. We also accept an object form ({userId, issueSlot})
   // as defence-in-depth in case a future writer switches the wire
   // format — a non-string/non-object (or a string that fails to decode)
   // falls through to null and we 404.
@@ -152,14 +158,12 @@ export default async function handler(req: Request): Promise<Response> {
   // string without JSON quotes), readRawJsonFromUpstash throws at
   // JSON.parse and the catch block above returns 503 — that is the
   // intended (loud) failure mode so the bug isn't silently served.
-  const pointer =
-    typeof pointerRaw === 'string'
-      ? decodePublicPointer(pointerRaw)
-      : decodePublicPointer(
-          pointerRaw != null && typeof pointerRaw === 'object'
-            ? `${(pointerRaw as { userId?: string }).userId}:${(pointerRaw as { issueDate?: string }).issueDate}`
-            : null,
-        );
+  let pointerInput: unknown = pointerRaw;
+  if (pointerRaw != null && typeof pointerRaw === 'object') {
+    const pointerObj = pointerRaw as { userId?: string; issueSlot?: string; issueDate?: string };
+    pointerInput = `${pointerObj.userId}:${pointerObj.issueSlot ?? pointerObj.issueDate}`;
+  }
+  const pointer = decodePublicPointer(pointerInput);
   if (!pointer) {
     return htmlResponse(req, 404, NOT_FOUND_PAGE);
   }
@@ -170,6 +174,7 @@ export default async function handler(req: Request): Promise<Response> {
     envelope = await readRawJsonFromUpstash(`brief:${pointer.userId}:${pointer.issueDate}`);
   } catch (err) {
     console.error('[api/brief/public] envelope read failed:', (err as Error).message);
+    captureSilentError(err, { tags: { route: 'api/brief/public', step: 'envelope-read' }, ctx });
     return htmlResponse(req, 503, UNAVAILABLE_PAGE);
   }
   if (!envelope) {
@@ -187,6 +192,7 @@ export default async function handler(req: Request): Promise<Response> {
     );
   } catch (err) {
     console.error('[api/brief/public] malformed envelope:', (err as Error).message);
+    captureSilentError(err, { tags: { route: 'api/brief/public', step: 'render' }, ctx });
     return htmlResponse(req, 404, NOT_FOUND_PAGE);
   }
 

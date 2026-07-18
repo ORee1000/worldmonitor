@@ -7,10 +7,13 @@ export interface GetVesselSnapshotRequest {
   swLat: number;
   swLon: number;
   includeCandidates: boolean;
+  includeTankers: boolean;
 }
 
 export interface GetVesselSnapshotResponse {
   snapshot?: VesselSnapshot;
+  fetchedAt: number;
+  dataAvailable: boolean;
 }
 
 export interface VesselSnapshot {
@@ -20,6 +23,7 @@ export interface VesselSnapshot {
   sequence: number;
   status?: AisSnapshotStatus;
   candidateReports: SnapshotCandidateReport[];
+  tankerReports: SnapshotCandidateReport[];
 }
 
 export interface AisDensityZone {
@@ -168,6 +172,7 @@ export function createMaritimeServiceRoutes(
             swLat: Number(params.get("sw_lat") ?? "0"),
             swLon: Number(params.get("sw_lon") ?? "0"),
             includeCandidates: params.get("include_candidates") === "true",
+            includeTankers: params.get("include_tankers") === "true",
           };
           if (options?.validateRequest) {
             const bodyViolations = options.validateRequest("getVesselSnapshot", body);

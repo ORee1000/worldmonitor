@@ -31,6 +31,18 @@ describe('classifyHttpCheckoutError', () => {
     assert.equal(err.retryable, false);
   });
 
+  it('maps 409 with PAYMENT_IN_PROGRESS to payment_in_progress (#4438)', () => {
+    const err = classifyHttpCheckoutError(409, {
+      error: 'PAYMENT_IN_PROGRESS',
+      message: 'A Pro Monthly payment is already in progress for this account',
+    });
+    assert.equal(err.code, 'payment_in_progress');
+    // Not a network retry — the user confirms a dialog to start a new checkout.
+    assert.equal(err.retryable, false);
+    // Raw server string stays off-screen.
+    assert.notEqual(err.userMessage, err.serverMessage);
+  });
+
   it('maps 409 without known error code to invalid_product (4xx)', () => {
     const err = classifyHttpCheckoutError(409, { error: 'SOMETHING_ELSE' });
     assert.equal(err.code, 'invalid_product');
@@ -45,6 +57,18 @@ describe('classifyHttpCheckoutError', () => {
   it('maps 404 to invalid_product', () => {
     const err = classifyHttpCheckoutError(404);
     assert.equal(err.code, 'invalid_product');
+  });
+
+  // 403 on the create-checkout edge route never comes from our handler or the
+  // Convex relay — it's Vercel firewall / edge bot-protection. "Temporarily
+  // unavailable" copy is honest and retryable; the generic 4xx copy ("That
+  // product isn't available") is misleading and tells the user to refresh
+  // forever. Originally surfaced as Sentry WORLDMONITOR-RN.
+  it('maps 403 to service_unavailable (infra block, retryable)', () => {
+    const err = classifyHttpCheckoutError(403);
+    assert.equal(err.code, 'service_unavailable');
+    assert.equal(err.retryable, true);
+    assert.equal(err.httpStatus, 403);
   });
 
   it('maps 500 to service_unavailable', () => {

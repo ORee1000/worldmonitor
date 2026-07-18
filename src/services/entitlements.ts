@@ -15,9 +15,23 @@ export interface EntitlementState {
     tier: number;
     apiAccess: boolean;
     apiRateLimit: number;
+    planLimits?: {
+      apiRequestsPerDay: number | null;
+      apiBurstRequestsPerMinute: number | null;
+      mcpCallsPerDay: number | null;
+      mcpBurstRequestsPerMinute: number | null;
+    };
     maxDashboards: number;
     prioritySupport: boolean;
     exportFormats: string[];
+    /**
+     * Pro MCP access (plan 2026-05-10-001). Undefined on legacy entitlement
+     * snapshots that pre-date the catalog field. `hasFeature('mcpAccess')`
+     * coerces undefined → false via Boolean(), so the settings tab
+     * fails-closed for unrefreshed Pro users (they'll see it appear once
+     * Dodo's next webhook repopulates the field).
+     */
+    mcpAccess?: boolean;
   };
   validUntil: number;
 }
